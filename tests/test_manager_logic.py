@@ -105,6 +105,7 @@ class ManagerLogicTests(unittest.TestCase):
         manager.consecutive_proxy_failures = 0
         manager.last_proxy_failure_node_id = ""
         manager.background_refill_thread = None
+        manager.bulk_probe_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
 
@@ -209,6 +210,38 @@ class ManagerLogicTests(unittest.TestCase):
         stored = manager.read_nodes()
         self.assertEqual(5, sum(node.get("probe_status") == "available" for node in stored))
         self.assertEqual(7, sum(node.get("probe_status") == "not_checked" for node in stored))
+
+    def test_bulk_probe_all_runs_in_background_and_reports_progress(self) -> None:
+        nodes = self.write_nodes(2)
+
+        def fake_test(node_ids, target_available=None, progress_callback=None):
+            results = []
+            for index, node_id in enumerate(node_ids):
+                result = {
+                    "id": node_id,
+                    "probe_status": "available" if index == 0 else "unavailable",
+                    "latency_ms": 12 if index == 0 else 0,
+                    "handshake_ms": 340 if index == 0 else 0,
+                }
+                results.append(result)
+                if progress_callback:
+                    progress_callback(index + 1, 1, index, result)
+            return results
+
+        with mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test):
+            started, message = manager.start_bulk_probe_all_nodes()
+            self.assertTrue(started)
+            self.assertIn("2", message)
+            thread = manager.bulk_probe_thread
+            self.assertIsNotNone(thread)
+            thread.join(timeout=2)
+
+        state = manager.get_state()
+        self.assertFalse(state["bulk_probe_running"])
+        self.assertEqual(2, state["bulk_probe_completed"])
+        self.assertEqual(1, state["bulk_probe_available"])
+        self.assertEqual(1, state["bulk_probe_unavailable"])
+        self.assertFalse(manager.maintenance_lock.locked())
 
     def test_ip_classification_separates_proxy_use_from_network_type(self) -> None:
         residential, residential_reason = manager.vpn_utils.classify_ip_type(
@@ -827,6 +860,10 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('colspan="7"', manager.INDEX_HTML)
         self.assertIn('class="country-option-input"', manager.INDEX_HTML)
         self.assertIn('${testBtn}', manager.INDEX_HTML)
+        self.assertIn('id="btn_test_all"', manager.INDEX_HTML)
+        self.assertIn('id="bulk_test_progress"', manager.INDEX_HTML)
+        self.assertIn('./api/test_all_nodes', manager.INDEX_HTML)
+        self.assertIn('OpenVPN 真实握手测试', manager.INDEX_HTML)
 
     def test_web_dashboard_has_browser_freeze_safeguards(self) -> None:
         self.assertNotIn("backdrop-filter", manager.LOGIN_HTML)

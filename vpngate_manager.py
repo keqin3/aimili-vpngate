@@ -21,7 +21,7 @@ from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import concurrent.futures
 import sys
 import uuid
@@ -204,6 +204,7 @@ connection_attempt_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
+bulk_probe_thread: threading.Thread | None = None
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 pending_openvpn_process: subprocess.Popen[str] | None = None
@@ -532,6 +533,16 @@ def get_state() -> dict[str, Any]:
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
     state["maintenance_running"] = maintenance_lock.locked()
+    # Runtime truth wins over a stale state.json left by a service restart.
+    state["bulk_probe_running"] = bool(
+        bulk_probe_thread is not None and bulk_probe_thread.is_alive()
+    )
+    state.setdefault("bulk_probe_total", 0)
+    state.setdefault("bulk_probe_completed", 0)
+    state.setdefault("bulk_probe_available", 0)
+    state.setdefault("bulk_probe_unavailable", 0)
+    state.setdefault("bulk_probe_started_at", 0)
+    state.setdefault("bulk_probe_finished_at", 0)
     state.setdefault("api_url", API_URL)
     state.setdefault("mirror_url", MIRROR_HTTPS_URL)
     state.setdefault("last_fetch_source", "")
@@ -2079,7 +2090,6 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         config_text = node.get("config_text") or ""
         h = str(node.get("remote_host") or node.get("ip"))
         p = parse_int(node.get("remote_port"))
-        fallback_ping = parse_int(node.get("ping"))
 
     temp_path = test_config_path(node_id)
     try:
@@ -2088,12 +2098,17 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     except Exception as e:
         raise RuntimeError(f"Failed to write temp config file: {e}")
 
-    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+    # Never copy the source-advertised ping into a manual test result.  A zero
+    # here means the host blocked ICMP/TCP timing; the OpenVPN handshake below
+    # is still the authoritative availability test.
+    latency = vpn_utils.ping_latency_ms(h, p, 0)
     
     idx = None
     try:
         idx = get_free_test_index()
+        handshake_started = time.monotonic()
         ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        handshake_ms = max(1, int((time.monotonic() - handshake_started) * 1000)) if ok else 0
     finally:
         if idx is not None:
             release_test_index(idx)
@@ -2123,6 +2138,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
             node["latency_ms"] = latency
+            node["handshake_ms"] = handshake_ms
             node["probe_status"] = "available" if ok else "unavailable"
             node["probe_message"] = message
             node["probed_at"] = time.time()
@@ -2153,7 +2169,11 @@ def is_systemic_probe_failure(message: Any) -> bool:
         )
     )
 
-def test_multiple_nodes(node_ids: list[str], target_available: int | None = None) -> list[dict[str, Any]]:
+def test_multiple_nodes(
+    node_ids: list[str],
+    target_available: int | None = None,
+    progress_callback: Callable[[int, int, int, dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
         to_test = [n for n in nodes if n.get("id") in node_ids]
@@ -2164,7 +2184,6 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         config_text = n_info.get("config_text") or ""
         h = str(n_info.get("remote_host") or n_info.get("ip"))
         p = parse_int(n_info.get("remote_port"))
-        fallback_ping = parse_int(n_info.get("ping"))
         
         temp_path = test_config_path(node_id)
         try:
@@ -2179,12 +2198,14 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
                 "probed_at": time.time(),
             }
             
-        latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+        latency = vpn_utils.ping_latency_ms(h, p, 0)
         tun_idx = None
         try:
             tun_idx = get_free_test_index()
             dev_name = f"tun{tun_idx}"
+            handshake_started = time.monotonic()
             ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
+            handshake_ms = max(1, int((time.monotonic() - handshake_started) * 1000)) if ok else 0
         finally:
             if tun_idx is not None:
                 release_test_index(tun_idx)
@@ -2200,6 +2221,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
             "remote_host": h,
             "remote_port": p,
             "latency_ms": latency,
+            "handshake_ms": handshake_ms,
             "probe_status": "available" if ok else "unavailable",
             "probe_message": message,
             "probed_at": time.time(),
@@ -2254,6 +2276,14 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
                             current.update(result)
                             break
                     write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                if progress_callback is not None:
+                    completed = len(updated_nodes_map)
+                    progress_callback(
+                        completed,
+                        available_count,
+                        completed - available_count,
+                        result,
+                    )
 
             if systemic_failure:
                 message = f"检测到系统级 OpenVPN 故障，已停止剩余节点探测: {systemic_failure}"
@@ -2280,6 +2310,112 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         write_json(NODES_FILE, sorted_nodes)
         
     return list(updated_nodes_map.values())
+
+
+def start_bulk_probe_all_nodes() -> tuple[bool, str]:
+    """Start a non-blocking OpenVPN handshake test for every cached node."""
+    global is_connecting, bulk_probe_thread
+
+    if not maintenance_lock.acquire(blocking=False):
+        return False, "当前已有连接或节点维护任务正在运行，请稍后再试"
+
+    with lock:
+        if is_connecting:
+            maintenance_lock.release()
+            return False, "当前已有连接或节点维护任务正在运行，请稍后再试"
+        node_ids = [str(node.get("id") or "").strip() for node in read_nodes()]
+        node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+        if not node_ids:
+            maintenance_lock.release()
+            return False, "当前没有可测试的节点，请先更新节点"
+        is_connecting = True
+
+    total = len(node_ids)
+    started_at = time.time()
+    try:
+        set_state(
+            is_connecting=True,
+            bulk_probe_running=True,
+            bulk_probe_total=total,
+            bulk_probe_completed=0,
+            bulk_probe_available=0,
+            bulk_probe_unavailable=0,
+            bulk_probe_started_at=started_at,
+            bulk_probe_finished_at=0,
+            last_check_message=f"正在实测全部 {total} 个节点：0/{total}",
+        )
+    except Exception:
+        with lock:
+            is_connecting = False
+        maintenance_lock.release()
+        raise
+
+    def worker() -> None:
+        global is_connecting
+
+        def update_progress(completed: int, available: int, unavailable: int, _result: dict[str, Any]) -> None:
+            set_state(
+                bulk_probe_completed=completed,
+                bulk_probe_available=available,
+                bulk_probe_unavailable=unavailable,
+                last_check_message=(
+                    f"正在实测全部节点：{completed}/{total}，"
+                    f"可用 {available}，不可用 {unavailable}"
+                ),
+            )
+
+        try:
+            results = test_multiple_nodes(node_ids, progress_callback=update_progress)
+            completed = len(results)
+            available = sum(item.get("probe_status") == "available" for item in results)
+            unavailable = completed - available
+            stopped = completed < total
+            message = (
+                f"全部节点实测{'提前停止' if stopped else '完成'}："
+                f"已测 {completed}/{total}，可用 {available}，不可用 {unavailable}"
+            )
+            set_state(
+                bulk_probe_running=False,
+                bulk_probe_completed=completed,
+                bulk_probe_available=available,
+                bulk_probe_unavailable=unavailable,
+                bulk_probe_finished_at=time.time(),
+                last_check_message=message,
+            )
+            log_to_json("INFO", "VPN", message)
+        except Exception as exc:
+            message = f"全部节点实测失败: {exc}"
+            set_state(
+                bulk_probe_running=False,
+                bulk_probe_finished_at=time.time(),
+                last_check_message=message,
+            )
+            log_to_json("ERROR", "VPN", message)
+        finally:
+            with lock:
+                is_connecting = False
+            set_state(is_connecting=False)
+            maintenance_lock.release()
+
+    bulk_probe_thread = threading.Thread(
+        target=worker,
+        name="vpngate-bulk-probe",
+        daemon=True,
+    )
+    try:
+        bulk_probe_thread.start()
+    except Exception:
+        with lock:
+            is_connecting = False
+        set_state(
+            is_connecting=False,
+            bulk_probe_running=False,
+            bulk_probe_finished_at=time.time(),
+            last_check_message="全部节点实测线程启动失败",
+        )
+        maintenance_lock.release()
+        raise
+    return True, f"已在后台启动全部 {total} 个节点的真实 OpenVPN 握手测试"
 
 def cancel_background_refill() -> None:
     background_refill_cancel_event.set()
@@ -4464,12 +4600,27 @@ INDEX_HTML = r"""<!doctype html>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
     </select>
-    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
+    <button id="btn_test_all" class="toolbar-btn" type="button" onclick="startAllNodeTest()" style="margin-left: auto; height: 42px; gap: 6px; border-color: rgba(16,185,129,.45); color: #34d399;">
+      <svg id="test_all_icon" xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+      </svg>
+      <span id="test_all_label">一键实测全部</span>
+    </button>
+    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
       </svg>
       收藏菜单
     </button>
+    <div id="bulk_test_progress" hidden style="flex-basis:100%; width:100%; padding:12px 14px; border:1px solid rgba(16,185,129,.28); background:rgba(16,185,129,.07); border-radius:9px; box-sizing:border-box;">
+      <div style="display:flex; justify-content:space-between; gap:12px; color:var(--text-secondary); font-size:12px; margin-bottom:8px;">
+        <span id="bulk_test_progress_text">等待开始</span>
+        <strong id="bulk_test_progress_percent" style="color:#34d399;">0%</strong>
+      </div>
+      <div style="height:7px; overflow:hidden; border-radius:999px; background:rgba(255,255,255,.08);">
+        <div id="bulk_test_progress_bar" style="height:100%; width:0%; border-radius:999px; background:linear-gradient(90deg,#10b981,#22d3ee); transition:width .25s ease;"></div>
+      </div>
+    </div>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
@@ -4823,6 +4974,8 @@ let discoveryCountriesInitialized = false;
 let discoveryCountriesDirty = false;
 let countryFilterSignature = "";
 let lastNodesSnapshotSignature = "";
+let bulkProbePollInterval = null;
+let bulkProbePollInFlight = false;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -5040,8 +5193,15 @@ function countryFlag(countryShort) {
 
 function nodeLatencyHtml(node) {
   const measured = Number(node && node.latency_ms) || 0;
+  const handshake = Number(node && node.handshake_ms) || 0;
   if (measured > 0) {
-    return `<span class="latency-val ${getLatencyClass(measured)}" title="本机实测延迟">${measured} ms</span>`;
+    const handshakeHtml = handshake > 0
+      ? `<span class="latency-source" title="完整 OpenVPN 握手耗时">握手 ${handshake} ms</span>`
+      : "";
+    return `<span class="latency-val ${getLatencyClass(measured)}" title="本机实测 ICMP/TCP 延迟">${measured} ms${handshakeHtml}</span>`;
+  }
+  if (handshake > 0) {
+    return `<span class="latency-val latency-medium" title="ICMP/TCP 延迟不可测；OpenVPN 完整握手成功">握手 ${handshake} ms<span class="latency-source">真实连接</span></span>`;
   }
   const estimated = Number(node && node.ping) || 0;
   if (estimated > 0) {
@@ -5206,6 +5366,7 @@ function render(){
     const modeLabel = state.deployment_mode_label || "Python 源码";
     $("deployment_mode_label").textContent = `${modeLabel}部署 · 更新通道：main`;
   }
+  updateBulkProbeUI();
 
   const activeNode = nodes.find(n => n && n.active);
   
@@ -5213,8 +5374,8 @@ function render(){
   const activeCardContainer = $("active_node_card");
   let activeCardHtml = "";
   if (state.is_connecting && !activeNode) {
-    const busyTitle = state.maintenance_running ? "正在更新节点" : "正在连接";
-    const busyLatency = state.maintenance_running ? "节点检测中" : (state.active_node_latency || "正在连接...");
+    const busyTitle = state.bulk_probe_running ? "正在实测全部节点" : (state.maintenance_running ? "正在更新节点" : "正在连接");
+    const busyLatency = state.bulk_probe_running ? `${Number(state.bulk_probe_completed) || 0}/${Number(state.bulk_probe_total) || 0}` : (state.maintenance_running ? "节点检测中" : (state.active_node_latency || "正在连接..."));
     const busyMessage = state.last_check_message || (state.maintenance_running ? "正在后台拉取并检测节点，已完成的结果会实时显示在下方列表。" : "正在与 VPN 节点建立加密隧道，请稍候...");
     activeCardHtml = `
       <div class="active-card" style="background: var(--bg-surface); border-color: var(--warning); box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);">
@@ -5311,9 +5472,9 @@ function render(){
     pBadge.style.background = "rgba(245, 158, 11, 0.15)";
     pBadge.style.color = "#f59e0b";
     pBadge.style.borderColor = "rgba(245, 158, 11, 0.3)";
-    pBadge.innerHTML = `<span class="badge-pulse" style="background: #f59e0b;"></span>正在连接`;
-    pIpVal.textContent = state.active_node_latency || "正在连接...";
-    pLatVal.innerHTML = `<span style="color: var(--text-secondary); font-size: 12px;">${esc(state.last_check_message || "正在与 VPN 节点建立加密隧道，请稍候...")}</span>`;
+    pBadge.innerHTML = `<span class="badge-pulse" style="background: #f59e0b;"></span>${state.bulk_probe_running ? "全部实测中" : "正在连接"}`;
+    pIpVal.textContent = state.bulk_probe_running ? `${Number(state.bulk_probe_completed) || 0}/${Number(state.bulk_probe_total) || 0}` : (state.active_node_latency || "正在连接...");
+    pLatVal.innerHTML = `<span style="color: var(--text-secondary); font-size: 12px;">${esc(state.last_check_message || (state.bulk_probe_running ? "正在执行 OpenVPN 真实握手测试..." : "正在与 VPN 节点建立加密隧道，请稍候..."))}</span>`;
     pBtn.disabled = true;
     pBtn.style.opacity = "0.5";
     pBtn.style.cursor = "not-allowed";
@@ -5537,6 +5698,81 @@ function applyNodesSnapshot(data) {
   return true;
 }
 
+function updateBulkProbeUI() {
+  const btn = $("btn_test_all");
+  const label = $("test_all_label");
+  const icon = $("test_all_icon");
+  const panel = $("bulk_test_progress");
+  if (!btn || !label || !panel) return;
+
+  const running = Boolean(state.bulk_probe_running);
+  const total = Math.max(0, Number(state.bulk_probe_total) || 0);
+  const completed = Math.min(total || Number(state.bulk_probe_completed) || 0, Number(state.bulk_probe_completed) || 0);
+  const available = Math.max(0, Number(state.bulk_probe_available) || 0);
+  const unavailable = Math.max(0, Number(state.bulk_probe_unavailable) || 0);
+  const percent = total > 0 ? Math.min(100, Math.round(completed * 100 / total)) : 0;
+  const hasResult = Boolean(state.bulk_probe_finished_at) && total > 0;
+
+  btn.disabled = running || Boolean(state.maintenance_running) || Boolean(state.is_connecting);
+  btn.style.opacity = btn.disabled ? "0.6" : "";
+  btn.style.cursor = btn.disabled ? "wait" : "pointer";
+  label.textContent = running ? `实测中 ${completed}/${total}` : (hasResult ? "重新实测全部" : "一键实测全部");
+  if (icon) icon.style.animation = running ? "spin 1s linear infinite" : "";
+
+  panel.hidden = !(running || hasResult);
+  if (!panel.hidden) {
+    $("bulk_test_progress_text").textContent = running
+      ? `OpenVPN 真实握手测试 ${completed}/${total} · 可用 ${available} · 不可用 ${unavailable}`
+      : `实测结束 ${completed}/${total} · 可用 ${available} · 不可用 ${unavailable}`;
+    $("bulk_test_progress_percent").textContent = `${percent}%`;
+    $("bulk_test_progress_bar").style.width = `${percent}%`;
+  }
+}
+
+function stopBulkProbePolling() {
+  if (bulkProbePollInterval) clearInterval(bulkProbePollInterval);
+  bulkProbePollInterval = null;
+}
+
+function startBulkProbePolling() {
+  if (bulkProbePollInterval) return;
+  bulkProbePollInterval = setInterval(async () => {
+    if (bulkProbePollInFlight || !isPageVisible()) return;
+    bulkProbePollInFlight = true;
+    try {
+      const data = await fetchNodesSnapshot();
+      applyNodesSnapshot(data);
+      if (!state.bulk_probe_running) stopBulkProbePolling();
+    } catch (error) {
+      console.error("刷新全部节点实测进度失败", error);
+    } finally {
+      bulkProbePollInFlight = false;
+    }
+  }, 1000);
+}
+
+async function startAllNodeTest() {
+  if (state.bulk_probe_running) return;
+  if (!nodes.length) {
+    alert("当前没有节点，请先点击更新节点");
+    return;
+  }
+  if (!confirm(`将对全部 ${nodes.length} 个节点执行真实 OpenVPN 握手测试。测试可能持续数分钟，是否继续？`)) return;
+
+  const btn = $("btn_test_all");
+  if (btn) btn.disabled = true;
+  try {
+    const response = await fetchWithTimeout("./api/test_all_nodes", { method: "POST" }, 25000);
+    const result = await readJsonResponse(response, "启动全部节点实测失败");
+    if (!result.ok) throw new Error(result.error || "启动失败");
+    await load();
+    startBulkProbePolling();
+  } catch (error) {
+    alert("全部节点实测启动失败: " + (error.message || "未知错误"));
+    try { await load(); } catch (loadError) { render(); }
+  }
+}
+
 function refreshButtonBusy(message = "正在后台更新...") {
   const btn = $("refresh");
   if (!btn) return;
@@ -5680,7 +5916,9 @@ async function load(){
   const d = await fetchNodesSnapshot();
   applyNodesSnapshot(d);
 
-  if (state.maintenance_running) {
+  if (state.bulk_probe_running) {
+    startBulkProbePolling();
+  } else if (state.maintenance_running) {
     startRefreshPolling();
   } else if (state.is_connecting) {
     startConnectionPolling();
@@ -7303,6 +7541,16 @@ class Handler(BaseHTTPRequestHandler):
                     })
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/test_all_nodes":
+            try:
+                self.read_request_body()
+                started, message = start_bulk_probe_all_nodes()
+                if not started:
+                    self.send_json({"ok": False, "error": message}, HTTPStatus.CONFLICT)
+                    return
+                self.send_json({"ok": True, "running": True, "message": message})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_nodes":
