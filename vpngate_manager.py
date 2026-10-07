@@ -77,6 +77,20 @@ def env_int(name: str, default: int, min_value: int | None = None, max_value: in
         return default
     return value
 
+
+def env_optional_limit(name: str, default: int = 0) -> int | None:
+    """Return None for an unlimited zero value, otherwise a positive limit."""
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        print(f"[配置警告] 环境变量 {name}={raw!r} 不是有效整数，使用默认值 {default}", flush=True)
+        value = default
+    if value < 0:
+        print(f"[配置警告] 环境变量 {name}={value} 不能为负数，使用默认值 {default}", flush=True)
+        value = default
+    return None if value == 0 else value
+
 def bounded_int(value: Any, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     try:
         parsed = int(value)
@@ -112,13 +126,15 @@ MIRROR_META_URL = os.environ.get(
 API_URL = API_HTTPS_URL
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
-TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
-MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
+TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 8, 1, 50)
+# 0 means unlimited. VPNGate sorts by score rather than access-network type, so
+# a fixed prefix can silently discard residential volunteers lower in the feed.
+MAX_SCAN_ROWS = env_optional_limit("MAX_SCAN_ROWS", 0)
 API_FETCH_TIMEOUT_SECONDS = env_int("API_FETCH_TIMEOUT_SECONDS", 10, 1, 60)
 API_SOURCE_DEADLINE_SECONDS = env_int("API_SOURCE_DEADLINE_SECONDS", 6, 2, 30)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
-INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
+INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 24, 1, 100)
 NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
 PROXY_FAILURE_THRESHOLD = env_int("PROXY_FAILURE_THRESHOLD", 3, 1, 10)
 SWITCH_PREFLIGHT_MAX_AGE_SECONDS = env_int("SWITCH_PREFLIGHT_MAX_AGE_SECONDS", 180, 0, 3600)
@@ -148,7 +164,7 @@ except OSError:
     _version_text = DEFAULT_APP_VERSION
 APP_VERSION = _version_text if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", _version_text) else DEFAULT_APP_VERSION
 APP_VERSION_LABEL = f"V{APP_VERSION} 正式版"
-GITHUB_REPOSITORY = "baoweise-bot/aimili-vpngate"
+GITHUB_REPOSITORY = os.environ.get("AIMILIVPN_GITHUB_REPOSITORY", "keqin3/aimili-vpngate").strip()
 GITHUB_REPOSITORY_URL = f"https://github.com/{GITHUB_REPOSITORY}"
 GITHUB_MAIN_BRANCH_URL = f"{GITHUB_REPOSITORY_URL}/tree/main"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
@@ -1045,7 +1061,7 @@ def rows_to_candidates(
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_ips: set[str] = set()
-    for row in rows[:MAX_SCAN_ROWS]:
+    for row in rows:
         ip = row.get("IP", "")
         if not ip or ip in seen_ips:
             continue
@@ -1752,9 +1768,21 @@ def country_matches(
         return str(node_country_short or "").strip().upper() == target_upper
     return normalized_country_name(node_country).casefold() == normalized_country_name(target).casefold()
 
-def probe_priority_key(node: dict[str, Any]) -> tuple[int, int, int, int]:
+def ip_type_priority(node: dict[str, Any]) -> int:
+    """Prefer consumer access networks, but keep unknown nodes discoverable."""
+    ip_type = str(node.get("ip_type") or "").strip().lower()
+    confidence = str(node.get("ip_type_confidence") or "").strip().lower()
+    if ip_type in {"residential", "mobile"} and confidence in {"medium", "high"}:
+        return 0
+    if not ip_type or ip_type == "unknown" or confidence == "low":
+        return 1
+    return 2
+
+
+def probe_priority_key(node: dict[str, Any]) -> tuple[int, int, int, int, int]:
     ping = parse_int(node.get("ping")) or 999999
     return (
+        ip_type_priority(node),
         ping,
         -parse_int(node.get("score")),
         -parse_int(node.get("speed")),
@@ -2495,15 +2523,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             "is_hosting",
                             "is_mobile",
                             "ip_type_reason",
+                            "ip_type_confidence",
+                            "ip_type_sources",
+                            "geo_country_short",
                         ]:
                             if previous.get(key) not in (None, ""):
                                 cand[key] = previous.get(key)
                     merged.append(cand)
                     seen_ids.add(cand["id"])
                     
-            if len(merged) > 1000:
-                merged = merged[:1000]
-                
             for n in merged:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
@@ -4179,8 +4207,8 @@ INDEX_HTML = r"""<!doctype html>
           <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
           检测更新
         </button>
-        <a href="https://github.com/baoweise-bot/aimili-vpngate/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
-        <a id="latest_release_link" href="https://github.com/baoweise-bot/aimili-vpngate/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
+        <a href="https://github.com/keqin3/aimili-vpngate/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
+        <a id="latest_release_link" href="https://github.com/keqin3/aimili-vpngate/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
         <div id="update_check_status" class="update-check-status" role="status" aria-live="polite">点击“检测更新”查询 GitHub 最新正式版。</div>
       </div>
     </div>

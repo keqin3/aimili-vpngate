@@ -47,8 +47,8 @@ echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="baoweise-bot"
+# This maintained fork carries the unlimited residential-candidate changes.
+DEFAULT_USER="keqin3"
 DEFAULT_REPO="aimili-vpngate"
 
 # Allow custom repository override via command line arguments
@@ -91,6 +91,7 @@ else
     if [ -d "${INSTALL_DIR}" ]; then
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
+        git remote set-url origin "${GITHUB_URL}" || true
         git fetch origin "${DEPLOY_BRANCH}" || true
         git checkout -B "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
         echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."

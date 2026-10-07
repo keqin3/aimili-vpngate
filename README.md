@@ -37,7 +37,7 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 | 本机代理 | `127.0.0.1:7928`，支持 HTTP、HTTPS `CONNECT` 和 SOCKS5 |
 | 源码部署 | x64、x86、ARM64、ARM32 Linux |
 | Docker 镜像 | `linux/amd64`、`linux/386`、`linux/arm64`、`linux/arm/v7` |
-| 更新通道 | GitHub `main` 正式分支 / 最新正式 Release |
+| 更新通道 | `keqin3/aimili-vpngate` 的 GitHub `main` 分支 |
 
 > [!IMPORTANT]
 > **网络可用性提示：** 不同地区、数据中心和网络服务商可能限制 DNS、VPNGate API、GitHub 镜像或 VPN 协议。镜像与本地缓存只能提高节点列表的可用性，不能保证所有机型都能建立连接。部署前请确认所在地法律和 VPS 服务商条款允许使用 VPN/TUN。
@@ -48,7 +48,7 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 使用 `root` 用户在受支持的 Linux VPS 上执行：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/keqin3/aimili-vpngate/main/upgrade.sh)
 ```
 
 安装完成后，终端会显示 Web 后台完整地址、随机安全路径、登录账号和密码。输入 `ml` 可打开管理菜单。
@@ -56,7 +56,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 无人值守安装可显式跳过首次参数询问，并自动生成安全路径和登录凭据：
 
 ```bash
-AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+AIMILIVPN_NONINTERACTIVE=1 bash <(curl -fsSL https://raw.githubusercontent.com/keqin3/aimili-vpngate/main/upgrade.sh)
 ```
 
 > [!TIP]
@@ -74,8 +74,12 @@ AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/bao
 ### 方式一：一键源码安装
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/keqin3/aimili-vpngate/main/upgrade.sh)
 ```
+
+该命令同时用于首次安装和后续升级。升级前会在 `/opt` 下生成带时间戳的备份，保留 `vpngate_data` 配置与缓存，并把 Git 更新源固定为 `keqin3/aimili-vpngate`。
+
+本分支默认设置 `MAX_SCAN_ROWS=0`，含义是读取 VPNGate 快照返回的全部候选，不再截断前 300/1000 条；实际住宅节点数量仍取决于上游当时提供的节点和 IP 情报接口可用性。
 
 安装器会部署到 `/opt/aimilivpn` 并注册系统服务。常用命令：
 
@@ -92,7 +96,7 @@ ml uninstall       # 卸载
 需要先审查脚本时：
 
 ```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
+git clone --branch main --single-branch https://github.com/keqin3/aimili-vpngate.git
 cd aimili-vpngate
 sudo bash install.sh
 ```

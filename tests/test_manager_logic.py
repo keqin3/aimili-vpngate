@@ -371,6 +371,34 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertEqual(["medium", "mobile"], [node["id"] for node in strict])
 
+    def test_probe_priority_prefers_verified_residential_then_unknown(self) -> None:
+        nodes = [
+            {"id": "hosting", "ip_type": "hosting", "ip_type_confidence": "high", "ping": 1, "score": 999},
+            {"id": "unknown", "ip_type": "", "ping": 1, "score": 999},
+            {"id": "residential", "ip_type": "residential", "ip_type_confidence": "medium", "ping": 50, "score": 1},
+        ]
+
+        nodes.sort(key=manager.probe_priority_key)
+
+        self.assertEqual(["residential", "unknown", "hosting"], [node["id"] for node in nodes])
+
+    def test_default_pool_is_unlimited_for_residential_discovery(self) -> None:
+        self.assertIsNone(manager.MAX_SCAN_ROWS)
+        self.assertGreaterEqual(manager.TARGET_VALID_NODES, 8)
+        self.assertGreaterEqual(manager.INITIAL_CONNECT_TEST_LIMIT, 24)
+
+    def test_snapshot_parser_keeps_rows_beyond_legacy_300_limit(self) -> None:
+        rows = [
+            (f"198.51.{index // 250}.{index % 250 + 1}", "Japan", "JP")
+            for index in range(325)
+        ]
+
+        parsed = manager.parse_vpngate_rows(valid_snapshot_rows(rows))
+        candidates = manager.rows_to_candidates(parsed, {})
+
+        self.assertEqual(325, len(parsed))
+        self.assertEqual(325, len(candidates))
+
     def test_background_ip_enrichment_merges_metadata_without_replacing_status(self) -> None:
         nodes = self.write_nodes(2)
         nodes[0]["probe_status"] = "available"
@@ -852,6 +880,8 @@ class ManagerLogicTests(unittest.TestCase):
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
 
         self.assertIn('DEPLOY_BRANCH="main"', install_text)
+        self.assertIn('DEFAULT_USER="keqin3"', install_text)
+        self.assertIn('git remote set-url origin "${GITHUB_URL}"', install_text)
         self.assertIn('branch = "main"', install_text)
         self.assertNotIn("CURRENT_BRANCH", install_text)
         self.assertNotIn("origin/master", install_text)
@@ -904,7 +934,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("2.2.0", result["latest_version"])
         self.assertEqual("v2.2.0", result["latest_tag"])
         self.assertEqual(
-            "https://github.com/baoweise-bot/aimili-vpngate/releases/tag/v2.2.0",
+            "https://github.com/keqin3/aimili-vpngate/releases/tag/v2.2.0",
             result["release_url"],
         )
         fetch_mock.assert_called_once_with(manager.GITHUB_LATEST_RELEASE_API, True)
