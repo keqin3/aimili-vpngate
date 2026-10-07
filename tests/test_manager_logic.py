@@ -106,6 +106,7 @@ class ManagerLogicTests(unittest.TestCase):
         manager.last_proxy_failure_node_id = ""
         manager.background_refill_thread = None
         manager.bulk_probe_thread = None
+        manager.auto_residential_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
 
@@ -285,6 +286,71 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn(nodes[1]["id"], remaining_ids)
         self.assertEqual([nodes[2]["id"]], manager.load_ui_config()["favorite_node_ids"])
         self.assertIn(nodes[0]["id"], manager.load_blacklist())
+
+    def test_auto_residential_settings_validate_and_persist_supported_intervals(self) -> None:
+        for interval in manager.AUTO_RESIDENTIAL_INTERVALS:
+            result = manager.save_auto_residential_settings(True, interval)
+            self.assertTrue(result["enabled"])
+            self.assertEqual(interval, result["interval_seconds"])
+            self.assertGreater(result["next_run_at"], 0)
+        with self.assertRaises(ValueError):
+            manager.save_auto_residential_settings(True, 7200)
+        disabled = manager.save_auto_residential_settings(False, 86400)
+        self.assertFalse(disabled["enabled"])
+        self.assertEqual(0, disabled["next_run_at"])
+
+    def test_delete_unavailable_nodes_can_limit_cleanup_to_residential_types(self) -> None:
+        nodes = self.write_nodes(3)
+        nodes[0].update({"ip_type": "residential", "probe_status": "unavailable", "consecutive_failures": 2})
+        nodes[1].update({"ip_type": "mobile", "probe_status": "unavailable", "consecutive_failures": 2})
+        nodes[2].update({"ip_type": "hosting", "probe_status": "unavailable", "consecutive_failures": 9})
+        manager.write_json(manager.NODES_FILE, nodes)
+
+        result = manager.delete_unavailable_nodes(
+            min_failures=2,
+            ip_types={"residential", "mobile"},
+            reason="scheduled test cleanup",
+        )
+
+        self.assertEqual(2, result["deleted"])
+        self.assertEqual({nodes[2]["id"]}, {node["id"] for node in manager.read_nodes()})
+
+    def test_auto_residential_maintenance_only_tests_target_types_and_prunes_failures(self) -> None:
+        nodes = self.write_nodes(3)
+        nodes[0].update({"ip_type": "residential", "consecutive_failures": 0})
+        nodes[1].update({"ip_type": "mobile", "consecutive_failures": 1})
+        nodes[2].update({"ip_type": "hosting", "probe_status": "unavailable", "consecutive_failures": 9})
+        manager.write_json(manager.NODES_FILE, nodes)
+        tested_ids = []
+
+        def fake_test(node_ids, target_available=None, progress_callback=None):
+            tested_ids.extend(node_ids)
+            results = []
+            current = manager.read_nodes()
+            for index, node_id in enumerate(node_ids):
+                status = "available" if node_id == nodes[0]["id"] else "unavailable"
+                result = {"id": node_id, "probe_status": status, "latency_ms": 8 if status == "available" else 0}
+                results.append(result)
+                for node in current:
+                    if node["id"] == node_id:
+                        manager.apply_probe_health(node, result)
+                if progress_callback:
+                    progress_callback(index + 1, int(status == "available"), int(status == "unavailable"), result)
+            manager.write_json(manager.NODES_FILE, current)
+            return results
+
+        with mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test):
+            started, _ = manager.start_auto_residential_maintenance(manual=True)
+            self.assertTrue(started)
+            manager.auto_residential_thread.join(timeout=2)
+
+        self.assertEqual({nodes[0]["id"], nodes[1]["id"]}, set(tested_ids))
+        remaining = {node["id"] for node in manager.read_nodes()}
+        self.assertIn(nodes[0]["id"], remaining)
+        self.assertNotIn(nodes[1]["id"], remaining)
+        self.assertIn(nodes[2]["id"], remaining)
+        self.assertEqual(1, manager.get_state()["auto_residential_deleted"])
+        self.assertFalse(manager.maintenance_lock.locked())
 
     def test_ip_classification_separates_proxy_use_from_network_type(self) -> None:
         residential, residential_reason = manager.vpn_utils.classify_ip_type(
@@ -911,6 +977,12 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('value="latency_asc">低延迟优先', manager.INDEX_HTML)
         self.assertIn('id="btn_delete_unavailable"', manager.INDEX_HTML)
         self.assertIn('./api/delete_unavailable_nodes', manager.INDEX_HTML)
+        self.assertIn('id="auto_residential_enabled"', manager.INDEX_HTML)
+        self.assertIn('id="auto_residential_interval"', manager.INDEX_HTML)
+        self.assertIn('value="3600">每 1 小时', manager.INDEX_HTML)
+        self.assertIn('value="604800">每 1 周', manager.INDEX_HTML)
+        self.assertIn('./api/auto_residential_maintenance', manager.INDEX_HTML)
+        self.assertIn('./api/run_auto_residential_maintenance', manager.INDEX_HTML)
 
     def test_web_dashboard_has_browser_freeze_safeguards(self) -> None:
         self.assertNotIn("backdrop-filter", manager.LOGIN_HTML)

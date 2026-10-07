@@ -174,6 +174,14 @@ UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 AUTO_PRUNE_FAILED_NODES = os.environ.get("AUTO_PRUNE_FAILED_NODES", "1").strip().lower() not in {"0", "false", "no", "off"}
 AUTO_PRUNE_FAILURE_THRESHOLD = env_int("AUTO_PRUNE_FAILURE_THRESHOLD", 2, 1, 20)
+AUTO_RESIDENTIAL_INTERVALS = {
+    3600: "1小时",
+    18000: "5小时",
+    36000: "10小时",
+    86400: "24小时",
+    604800: "1周",
+}
+DEFAULT_AUTO_RESIDENTIAL_INTERVAL = 86400
 DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "source").strip().lower()
 if DEPLOYMENT_MODE not in {"source", "docker"}:
     DEPLOYMENT_MODE = "source"
@@ -215,6 +223,7 @@ background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
 bulk_probe_thread: threading.Thread | None = None
+auto_residential_thread: threading.Thread | None = None
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 pending_openvpn_process: subprocess.Popen[str] | None = None
@@ -375,6 +384,8 @@ def load_ui_config() -> dict[str, Any]:
             "favorite_node_ids": [],
             "fav_fail_fallback": False,
             "discovery_countries": [],
+            "auto_residential_enabled": False,
+            "auto_residential_interval_seconds": DEFAULT_AUTO_RESIDENTIAL_INTERVAL,
         }
         updated = False
         if auth_file.exists():
@@ -386,7 +397,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "auto_residential_enabled", "auto_residential_interval_seconds"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -418,6 +429,22 @@ def load_ui_config() -> dict[str, Any]:
         normalized_discovery_countries = normalize_discovery_countries(config.get("discovery_countries"))
         if normalized_discovery_countries != config.get("discovery_countries"):
             config["discovery_countries"] = normalized_discovery_countries
+            updated = True
+
+        normalized_auto_interval = bounded_int(
+            config.get("auto_residential_interval_seconds"),
+            DEFAULT_AUTO_RESIDENTIAL_INTERVAL,
+            min(AUTO_RESIDENTIAL_INTERVALS),
+            max(AUTO_RESIDENTIAL_INTERVALS),
+        )
+        if normalized_auto_interval not in AUTO_RESIDENTIAL_INTERVALS:
+            normalized_auto_interval = DEFAULT_AUTO_RESIDENTIAL_INTERVAL
+        if normalized_auto_interval != config.get("auto_residential_interval_seconds"):
+            config["auto_residential_interval_seconds"] = normalized_auto_interval
+            updated = True
+        normalized_auto_enabled = bool(config.get("auto_residential_enabled", False))
+        if normalized_auto_enabled != config.get("auto_residential_enabled"):
+            config["auto_residential_enabled"] = normalized_auto_enabled
             updated = True
             
         if not auth_file.exists() or updated:
@@ -547,6 +574,9 @@ def get_state() -> dict[str, Any]:
     state["bulk_probe_running"] = bool(
         bulk_probe_thread is not None and bulk_probe_thread.is_alive()
     )
+    state["auto_residential_running"] = bool(
+        auto_residential_thread is not None and auto_residential_thread.is_alive()
+    )
     state.setdefault("bulk_probe_total", 0)
     state.setdefault("bulk_probe_completed", 0)
     state.setdefault("bulk_probe_available", 0)
@@ -586,6 +616,17 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
+    state["auto_residential_enabled"] = bool(ui_cfg.get("auto_residential_enabled", False))
+    state["auto_residential_interval_seconds"] = int(
+        ui_cfg.get("auto_residential_interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL)
+    )
+    state.setdefault("auto_residential_last_run_at", 0)
+    state.setdefault("auto_residential_next_run_at", 0)
+    state.setdefault("auto_residential_tested", 0)
+    state.setdefault("auto_residential_available", 0)
+    state.setdefault("auto_residential_unavailable", 0)
+    state.setdefault("auto_residential_deleted", 0)
+    state.setdefault("auto_residential_message", "")
     state["fav_fail_fallback"] = False
     
     return state
@@ -1023,6 +1064,7 @@ def delete_unavailable_nodes(
     *,
     min_failures: int = 0,
     preserve_favorites: bool = False,
+    ip_types: set[str] | None = None,
     reason: str = "手动批量删除失效节点",
 ) -> dict[str, Any]:
     """Delete failed, inactive nodes and temporarily blacklist them against immediate re-import."""
@@ -1045,6 +1087,7 @@ def delete_unavailable_nodes(
                 and parse_int(node.get("consecutive_failures")) >= max(0, min_failures)
                 and (requested is None or node_id in requested)
                 and (not preserve_favorites or node_id not in favorite_ids)
+                and (ip_types is None or str(node.get("ip_type") or "").lower() in ip_types)
             )
             if eligible:
                 removed.append(node)
@@ -2528,6 +2571,193 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
         maintenance_lock.release()
         raise
     return True, f"已在后台启动全部 {total} 个节点的真实 OpenVPN 握手测试"
+
+
+def save_auto_residential_settings(enabled: Any, interval_seconds: Any) -> dict[str, Any]:
+    """Validate and persist the automatic residential-node maintenance schedule."""
+    if not isinstance(enabled, bool):
+        raise ValueError("自动整理开关必须是布尔值")
+    try:
+        interval = int(interval_seconds)
+    except (TypeError, ValueError):
+        raise ValueError("自动整理周期无效")
+    if interval not in AUTO_RESIDENTIAL_INTERVALS:
+        raise ValueError("自动整理周期仅支持 1小时、5小时、10小时、24小时或1周")
+    enabled_bool = enabled
+    ui_cfg = load_ui_config()
+    old_enabled = bool(ui_cfg.get("auto_residential_enabled"))
+    old_interval = int(ui_cfg.get("auto_residential_interval_seconds") or DEFAULT_AUTO_RESIDENTIAL_INTERVAL)
+    current = get_state()
+    next_run = float(current.get("auto_residential_next_run_at") or 0)
+    ui_cfg["auto_residential_enabled"] = enabled_bool
+    ui_cfg["auto_residential_interval_seconds"] = interval
+    with lock:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+    now = time.time()
+    if enabled_bool and (not old_enabled or interval != old_interval or next_run <= now):
+        next_run = now + interval
+    elif not enabled_bool:
+        next_run = 0
+    set_state(auto_residential_next_run_at=next_run)
+    return {
+        "enabled": enabled_bool,
+        "interval_seconds": interval,
+        "interval_label": AUTO_RESIDENTIAL_INTERVALS[interval],
+        "next_run_at": next_run,
+    }
+
+
+def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, str]:
+    """Test, latency-sort and safely prune failed residential/mobile nodes in background."""
+    global is_connecting, auto_residential_thread
+
+    if auto_residential_thread is not None and auto_residential_thread.is_alive():
+        return False, "住宅节点自动整理任务已经在运行"
+    if not maintenance_lock.acquire(blocking=False):
+        return False, "当前已有连接、更新或测速任务，自动整理稍后重试"
+
+    with lock:
+        if is_connecting:
+            maintenance_lock.release()
+            return False, "当前已有连接、更新或测速任务，自动整理稍后重试"
+        node_ids = [
+            str(node.get("id") or "").strip()
+            for node in read_nodes()
+            if str(node.get("ip_type") or "").lower() in {"residential", "mobile"}
+        ]
+        node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+        if not node_ids:
+            maintenance_lock.release()
+            message = "当前没有已识别的住宅/移动网络节点，请先更新节点并等待 IP 类型识别完成"
+            if manual:
+                set_state(auto_residential_message=message)
+            return False, message
+        is_connecting = True
+
+    total = len(node_ids)
+    set_state(
+        is_connecting=True,
+        auto_residential_running=True,
+        auto_residential_tested=0,
+        auto_residential_available=0,
+        auto_residential_unavailable=0,
+        auto_residential_deleted=0,
+        auto_residential_message=f"正在自动实测住宅节点：0/{total}",
+        last_check_message=f"正在自动实测 {total} 个住宅节点：0/{total}",
+    )
+
+    def worker() -> None:
+        global is_connecting
+
+        def update_progress(completed: int, available: int, unavailable: int, _result: dict[str, Any]) -> None:
+            message = f"正在自动实测住宅节点：{completed}/{total}，可用 {available}，不可用 {unavailable}"
+            set_state(
+                auto_residential_tested=completed,
+                auto_residential_available=available,
+                auto_residential_unavailable=unavailable,
+                auto_residential_message=message,
+                last_check_message=message,
+            )
+
+        finished_at = time.time()
+        try:
+            results = test_multiple_nodes(node_ids, progress_callback=update_progress)
+            completed = len(results)
+            available = sum(item.get("probe_status") == "available" for item in results)
+            unavailable = completed - available
+            stopped = completed < total
+            deleted = 0
+            if not stopped:
+                cleanup = delete_unavailable_nodes(
+                    min_failures=AUTO_PRUNE_FAILURE_THRESHOLD,
+                    preserve_favorites=True,
+                    ip_types={"residential", "mobile"},
+                    reason=f"自动整理：连续 {AUTO_PRUNE_FAILURE_THRESHOLD} 次真实握手失败",
+                )
+                deleted = int(cleanup.get("deleted", 0) or 0)
+            finished_at = time.time()
+            message = (
+                f"住宅节点自动整理{'提前停止' if stopped else '完成'}："
+                f"已测 {completed}/{total}，可用 {available}，不可用 {unavailable}，删除 {deleted}"
+            )
+            cfg = load_ui_config()
+            next_run = finished_at + int(cfg.get("auto_residential_interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL)) \
+                if cfg.get("auto_residential_enabled") else 0
+            set_state(
+                auto_residential_running=False,
+                auto_residential_last_run_at=finished_at,
+                auto_residential_next_run_at=next_run,
+                auto_residential_tested=completed,
+                auto_residential_available=available,
+                auto_residential_unavailable=unavailable,
+                auto_residential_deleted=deleted,
+                auto_residential_message=message,
+                last_check_message=message,
+            )
+            log_to_json("INFO", "VPN", message)
+        except Exception as exc:
+            finished_at = time.time()
+            cfg = load_ui_config()
+            next_run = finished_at + int(cfg.get("auto_residential_interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL)) \
+                if cfg.get("auto_residential_enabled") else 0
+            message = f"住宅节点自动整理失败: {exc}"
+            set_state(
+                auto_residential_running=False,
+                auto_residential_last_run_at=finished_at,
+                auto_residential_next_run_at=next_run,
+                auto_residential_message=message,
+                last_check_message=message,
+            )
+            log_to_json("ERROR", "VPN", message)
+        finally:
+            with lock:
+                is_connecting = False
+            set_state(is_connecting=False)
+            maintenance_lock.release()
+
+    auto_residential_thread = threading.Thread(
+        target=worker,
+        name="vpngate-auto-residential-maintenance",
+        daemon=True,
+    )
+    try:
+        auto_residential_thread.start()
+    except Exception:
+        with lock:
+            is_connecting = False
+        set_state(is_connecting=False, auto_residential_running=False)
+        maintenance_lock.release()
+        raise
+    return True, f"已启动 {total} 个住宅节点的自动测速、排序与失效清理"
+
+
+def auto_residential_scheduler_loop() -> None:
+    """Wake periodically and launch the persisted residential maintenance schedule."""
+    while True:
+        try:
+            cfg = load_ui_config()
+            if not cfg.get("auto_residential_enabled"):
+                if float(get_state().get("auto_residential_next_run_at") or 0) != 0:
+                    set_state(auto_residential_next_run_at=0)
+                time.sleep(30)
+                continue
+            interval = int(cfg.get("auto_residential_interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL))
+            if interval not in AUTO_RESIDENTIAL_INTERVALS:
+                interval = DEFAULT_AUTO_RESIDENTIAL_INTERVAL
+            current = get_state()
+            next_run = float(current.get("auto_residential_next_run_at") or 0)
+            now = time.time()
+            if next_run <= 0:
+                set_state(auto_residential_next_run_at=now + interval)
+            elif now >= next_run:
+                started, message = start_auto_residential_maintenance()
+                if not started:
+                    set_state(auto_residential_message=message)
+            time.sleep(30)
+        except Exception as exc:
+            log_to_json("ERROR", "Scheduler", f"住宅节点自动整理调度异常: {exc}")
+            time.sleep(60)
 
 def cancel_background_refill() -> None:
     background_refill_cancel_event.set()
@@ -4742,6 +4972,22 @@ INDEX_HTML = r"""<!doctype html>
         <div id="bulk_test_progress_bar" style="height:100%; width:0%; border-radius:999px; background:linear-gradient(90deg,#10b981,#22d3ee); transition:width .25s ease;"></div>
       </div>
     </div>
+    <div id="auto_residential_panel" style="flex-basis:100%; width:100%; padding:14px; border:1px solid rgba(34,211,238,.25); background:rgba(34,211,238,.055); border-radius:10px; box-sizing:border-box; display:flex; flex-wrap:wrap; align-items:center; gap:10px;">
+      <label style="display:flex; align-items:center; gap:8px; font-size:13px; font-weight:700; color:var(--text-primary);">
+        <input id="auto_residential_enabled" type="checkbox" style="width:17px; height:17px; accent-color:#10b981;">
+        自动整理住宅节点
+      </label>
+      <select id="auto_residential_interval" aria-label="自动整理周期" style="height:38px;">
+        <option value="3600">每 1 小时</option>
+        <option value="18000">每 5 小时</option>
+        <option value="36000">每 10 小时</option>
+        <option value="86400">每 24 小时</option>
+        <option value="604800">每 1 周</option>
+      </select>
+      <button id="btn_save_auto_residential" class="toolbar-btn" type="button" onclick="saveAutoResidentialMaintenance()" style="height:38px; color:#22d3ee; border-color:rgba(34,211,238,.4);">保存设置</button>
+      <button id="btn_run_auto_residential" class="toolbar-btn" type="button" onclick="runAutoResidentialMaintenanceNow()" style="height:38px; color:#34d399; border-color:rgba(16,185,129,.4);">立即整理一次</button>
+      <span id="auto_residential_status" style="flex:1 1 320px; min-width:240px; font-size:12px; line-height:1.6; color:var(--text-secondary);">自动整理未启用</span>
+    </div>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
@@ -5509,6 +5755,7 @@ function render(){
     $("deployment_mode_label").textContent = `${modeLabel}部署 · 更新通道：main`;
   }
   updateBulkProbeUI();
+  updateAutoResidentialUI();
   const failedCount = nodes.filter(n => n && n.probe_status === "unavailable" && !n.active).length;
   const deleteButton = $("btn_delete_unavailable");
   const deleteLabel = $("delete_unavailable_label");
@@ -5880,6 +6127,85 @@ function updateBulkProbeUI() {
   }
 }
 
+let autoResidentialDirty = false;
+function formatScheduleTime(epochSeconds) {
+  const value = Number(epochSeconds) || 0;
+  if (!value) return "未安排";
+  return new Date(value * 1000).toLocaleString("zh-CN", { hour12: false });
+}
+
+function updateAutoResidentialUI() {
+  const enabledInput = $("auto_residential_enabled");
+  const intervalInput = $("auto_residential_interval");
+  const status = $("auto_residential_status");
+  const saveButton = $("btn_save_auto_residential");
+  const runButton = $("btn_run_auto_residential");
+  if (!enabledInput || !intervalInput || !status) return;
+  if (!autoResidentialDirty) {
+    enabledInput.checked = Boolean(state.auto_residential_enabled);
+    intervalInput.value = String(Number(state.auto_residential_interval_seconds) || 86400);
+  }
+  const running = Boolean(state.auto_residential_running);
+  const busy = running || Boolean(state.bulk_probe_running) || Boolean(state.maintenance_running) || Boolean(state.is_connecting);
+  if (saveButton) saveButton.disabled = running;
+  if (runButton) {
+    runButton.disabled = busy;
+    runButton.textContent = running ? "自动整理中…" : "立即整理一次";
+  }
+  if (running) {
+    status.textContent = state.auto_residential_message || "正在自动测速、低延迟排序并清理失效住宅节点…";
+    status.style.color = "#34d399";
+  } else if (state.auto_residential_enabled) {
+    const last = Number(state.auto_residential_last_run_at) ? `上次：${formatScheduleTime(state.auto_residential_last_run_at)}；` : "尚未执行；";
+    const summary = Number(state.auto_residential_last_run_at)
+      ? `上轮已测 ${Number(state.auto_residential_tested) || 0}，可用 ${Number(state.auto_residential_available) || 0}，失效 ${Number(state.auto_residential_unavailable) || 0}，删除 ${Number(state.auto_residential_deleted) || 0}；`
+      : "";
+    status.textContent = `自动整理已启用。${last}${summary}下次：${formatScheduleTime(state.auto_residential_next_run_at)}`;
+    status.style.color = "#22d3ee";
+  } else {
+    status.textContent = "自动整理未启用；收藏节点和当前活动节点始终不会被自动删除。";
+    status.style.color = "var(--text-secondary)";
+  }
+}
+
+async function saveAutoResidentialMaintenance() {
+  const enabled = Boolean($("auto_residential_enabled").checked);
+  const intervalSeconds = Number($("auto_residential_interval").value);
+  const button = $("btn_save_auto_residential");
+  if (button) button.disabled = true;
+  try {
+    const response = await fetchWithTimeout("./api/auto_residential_maintenance", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, interval_seconds: intervalSeconds })
+    }, 20000);
+    const result = await readJsonResponse(response, "保存自动整理设置失败");
+    autoResidentialDirty = false;
+    await load();
+    alert(result.message || "自动整理设置已保存");
+  } catch (error) {
+    alert("保存自动整理设置失败: " + (error.message || "未知错误"));
+  } finally {
+    if (button) button.disabled = false;
+    render();
+  }
+}
+
+async function runAutoResidentialMaintenanceNow() {
+  const button = $("btn_run_auto_residential");
+  if (button) button.disabled = true;
+  try {
+    const response = await fetchWithTimeout("./api/run_auto_residential_maintenance", { method: "POST" }, 25000);
+    const result = await readJsonResponse(response, "启动自动整理失败");
+    if (!result.ok) throw new Error(result.error || "启动失败");
+    await load();
+    startBulkProbePolling();
+  } catch (error) {
+    alert("启动住宅节点整理失败: " + (error.message || "未知错误"));
+    try { await load(); } catch (loadError) { render(); }
+  }
+}
+
 function stopBulkProbePolling() {
   if (bulkProbePollInterval) clearInterval(bulkProbePollInterval);
   bulkProbePollInterval = null;
@@ -5893,7 +6219,7 @@ function startBulkProbePolling() {
     try {
       const data = await fetchNodesSnapshot();
       applyNodesSnapshot(data);
-      if (!state.bulk_probe_running) stopBulkProbePolling();
+      if (!state.bulk_probe_running && !state.auto_residential_running) stopBulkProbePolling();
     } catch (error) {
       console.error("刷新全部节点实测进度失败", error);
     } finally {
@@ -5903,7 +6229,7 @@ function startBulkProbePolling() {
 }
 
 async function startAllNodeTest() {
-  if (state.bulk_probe_running) return;
+  if (state.bulk_probe_running || state.auto_residential_running) return;
   if (!nodes.length) {
     alert("当前没有节点，请先点击更新节点");
     return;
@@ -6094,7 +6420,7 @@ async function load(){
   const d = await fetchNodesSnapshot();
   applyNodesSnapshot(d);
 
-  if (state.bulk_probe_running) {
+  if (state.bulk_probe_running || state.auto_residential_running) {
     startBulkProbePolling();
   } else if (state.maintenance_running) {
     startRefreshPolling();
@@ -6119,6 +6445,8 @@ document.addEventListener("keydown", event => {
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
 $("sort_filter").onchange=()=>{ currentPage = 1; render(); };
+$("auto_residential_enabled").onchange=()=>{ autoResidentialDirty = true; updateAutoResidentialUI(); };
+$("auto_residential_interval").onchange=()=>{ autoResidentialDirty = true; updateAutoResidentialUI(); };
 
 $("refresh").onclick=async()=>{
   refreshButtonBusy("正在启动更新...");
@@ -7722,6 +8050,33 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/auto_residential_maintenance":
+            try:
+                payload = self.read_json_body()
+                settings = save_auto_residential_settings(
+                    payload.get("enabled", False),
+                    payload.get("interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL),
+                )
+                action = "已启用" if settings["enabled"] else "已关闭"
+                self.send_json({
+                    "ok": True,
+                    **settings,
+                    "message": f"住宅节点自动整理{action}，周期：{settings['interval_label']}",
+                })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/run_auto_residential_maintenance":
+            try:
+                self.read_request_body()
+                started, message = start_auto_residential_maintenance(manual=True)
+                if not started:
+                    self.send_json({"ok": False, "error": message}, HTTPStatus.CONFLICT)
+                    return
+                self.send_json({"ok": True, "running": True, "message": message})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_all_nodes":
             try:
                 self.read_request_body()
@@ -7914,6 +8269,13 @@ class Tee:
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
+    previous_runtime_state = read_json(STATE_FILE, {})
+    initial_ui_cfg = load_ui_config()
+    auto_enabled = bool(initial_ui_cfg.get("auto_residential_enabled", False))
+    auto_interval = int(initial_ui_cfg.get("auto_residential_interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL))
+    previous_next_run = float(previous_runtime_state.get("auto_residential_next_run_at") or 0) if isinstance(previous_runtime_state, dict) else 0
+    if auto_enabled and previous_next_run <= 0:
+        previous_next_run = time.time() + auto_interval
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -7940,6 +8302,14 @@ def main() -> None:
             "pending_node_id": "",
             "active_node_latency": "正在准备",
             "blacklisted_nodes": 0,
+            "auto_residential_running": False,
+            "auto_residential_last_run_at": previous_runtime_state.get("auto_residential_last_run_at", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "auto_residential_next_run_at": previous_next_run if auto_enabled else 0,
+            "auto_residential_tested": previous_runtime_state.get("auto_residential_tested", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "auto_residential_available": previous_runtime_state.get("auto_residential_available", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "auto_residential_unavailable": previous_runtime_state.get("auto_residential_unavailable", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "auto_residential_deleted": previous_runtime_state.get("auto_residential_deleted", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "auto_residential_message": previous_runtime_state.get("auto_residential_message", "") if isinstance(previous_runtime_state, dict) else "",
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
@@ -7991,6 +8361,7 @@ def main() -> None:
     threading.Thread(target=ip_enrichment_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
+    threading.Thread(target=auto_residential_scheduler_loop, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
