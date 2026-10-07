@@ -61,6 +61,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 import vpn_utils
 import proxy_server
 import snapshot_utils
+import node_sources
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -122,6 +123,23 @@ MIRROR_META_URL = os.environ.get(
     "VPNGATE_MIRROR_META_URL",
     "https://baoweise-bot.github.io/aimili-vpngate/vpngate.meta.json",
 ).strip()
+NODE_SOURCES = {
+    item.strip().lower()
+    for item in os.environ.get("NODE_SOURCES", "vpngate,ipspeed,vpngate_scraper").split(",")
+    if item.strip()
+}
+IPSPEED_INDEX_URL = os.environ.get("IPSPEED_INDEX_URL", "https://ipspeed.info/free-openvpn.php").strip()
+VPNGATE_SCRAPER_README_URL = os.environ.get(
+    "VPNGATE_SCRAPER_README_URL",
+    "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/README.md",
+).strip()
+VPNGATE_SCRAPER_RAW_BASE_URL = os.environ.get(
+    "VPNGATE_SCRAPER_RAW_BASE_URL",
+    "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/",
+).strip()
+EXTERNAL_SOURCE_MAX_PROFILES = env_optional_limit("EXTERNAL_SOURCE_MAX_PROFILES", 300)
+EXTERNAL_SOURCE_WORKERS = env_int("EXTERNAL_SOURCE_WORKERS", 6, 1, 12)
+EXTERNAL_SOURCE_TIMEOUT_SECONDS = env_int("EXTERNAL_SOURCE_TIMEOUT_SECONDS", 15, 2, 60)
 # Kept as the primary URL for diagnostics and backwards-compatible state output.
 API_URL = API_HTTPS_URL
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
@@ -965,6 +983,7 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
     country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, vpn_utils.COUNTRY_TRANSLATIONS.get(country_long.strip(), country_long))
     return {
         "id": node_id,
+        "source": str(row.get("_source") or "vpngate"),
         "country": country_zh,
         "country_short": country_short,
         "host_name": row.get("HostName", ""),
@@ -1060,10 +1079,10 @@ def rows_to_candidates(
     blacklist: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    seen_ips: set[str] = set()
+    seen_endpoints: set[tuple[str, int, str]] = set()
     for row in rows:
         ip = row.get("IP", "")
-        if not ip or ip in seen_ips:
+        if not ip:
             continue
         try:
             config_text = decode_config(row.get("OpenVPN_ConfigData_Base64", ""))
@@ -1073,11 +1092,14 @@ def rows_to_candidates(
             print(f"[fetch_candidates] 跳过损坏或不安全的节点配置记录: {row_exc}", flush=True)
             log_to_json("WARNING", "Main", f"跳过损坏或不安全的节点配置记录: {row_exc}")
             continue
+        endpoint = candidate_endpoint_key(node)
+        if endpoint in seen_endpoints:
+            continue
         entry = blacklist.get(node["id"])
         if entry and float(entry.get("until", 0) or 0) > time.time():
             continue
         candidates.append(node)
-        seen_ips.add(ip)
+        seen_endpoints.add(endpoint)
     return candidates
 
 def filter_candidates_by_discovery_countries(
@@ -1093,7 +1115,7 @@ def filter_candidates_by_discovery_countries(
         if str(candidate.get("country_short") or "").strip().upper() in selected
     ]
 
-def fetch_candidates() -> list[dict[str, Any]]:
+def fetch_vpngate_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     discovery_countries = normalize_discovery_countries(
         load_ui_config().get("discovery_countries")
@@ -1211,6 +1233,156 @@ def fetch_candidates() -> list[dict[str, Any]]:
     if last_err:
         raise RuntimeError(diag_msg) from last_err
     raise RuntimeError(diag_msg)
+
+
+def candidate_endpoint_key(node: dict[str, Any]) -> tuple[str, int, str]:
+    host = str(node.get("remote_host") or node.get("ip") or "").strip().lower()
+    port = parse_int(node.get("remote_port"))
+    proto = str(node.get("proto") or "").strip().lower()
+    if proto.startswith("tcp"):
+        proto = "tcp"
+    elif proto.startswith("udp"):
+        proto = "udp"
+    return host, port, proto
+
+
+def merge_candidate_pools(pools: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for pool in pools:
+        for node in pool:
+            endpoint = candidate_endpoint_key(node)
+            if not endpoint[0] or endpoint in seen:
+                continue
+            seen.add(endpoint)
+            merged.append(node)
+    return merged
+
+
+def external_record_to_node(record: dict[str, Any], config_text: str) -> dict[str, Any]:
+    remote_host, _, _ = vpn_utils.parse_remote(config_text, str(record.get("ip") or ""))
+    row = {
+        "_source": str(record.get("source") or "external"),
+        "HostName": str(record.get("hostname") or remote_host),
+        "IP": str(record.get("ip") or remote_host),
+        "Score": "0",
+        "Ping": str(parse_int(record.get("ping"))),
+        "Speed": str(int(float(record.get("speed_mbps") or 0) * 1_000_000)),
+        "CountryLong": str(record.get("country") or ""),
+        "CountryShort": str(record.get("country_short") or "").upper(),
+        "NumVpnSessions": "0",
+    }
+    return row_to_node(row, config_text)
+
+
+def fetch_external_candidates(source_name: str) -> list[dict[str, Any]]:
+    if source_name == "ipspeed":
+        records = node_sources.parse_ipspeed_index(
+            node_sources.fetch_https_text(
+                IPSPEED_INDEX_URL,
+                {"ipspeed.info", "www.ipspeed.info"},
+                node_sources.MAX_INDEX_BYTES,
+                EXTERNAL_SOURCE_TIMEOUT_SECONDS,
+            ),
+            IPSPEED_INDEX_URL,
+        )
+        allowed_hosts = {"ipspeed.info", "www.ipspeed.info"}
+    elif source_name == "vpngate_scraper":
+        records = node_sources.parse_vpngate_scraper_readme(
+            node_sources.fetch_https_text(
+                VPNGATE_SCRAPER_README_URL,
+                {"raw.githubusercontent.com"},
+                node_sources.MAX_INDEX_BYTES,
+                EXTERNAL_SOURCE_TIMEOUT_SECONDS,
+            ),
+            VPNGATE_SCRAPER_RAW_BASE_URL,
+        )
+        allowed_hosts = {"raw.githubusercontent.com"}
+    else:
+        raise ValueError(f"不支持的外部节点源: {source_name}")
+
+    if EXTERNAL_SOURCE_MAX_PROFILES is not None:
+        records = records[:EXTERNAL_SOURCE_MAX_PROFILES]
+    blacklist = load_blacklist()
+
+    def download(record: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            config_text = node_sources.fetch_https_text(
+                str(record.get("profile_url") or ""),
+                allowed_hosts,
+                node_sources.MAX_PROFILE_BYTES,
+                EXTERNAL_SOURCE_TIMEOUT_SECONDS,
+            )
+            snapshot_utils.validate_openvpn_config(config_text)
+            node = external_record_to_node(record, config_text)
+            entry = blacklist.get(node["id"])
+            if entry and float(entry.get("until", 0) or 0) > time.time():
+                return None
+            return node
+        except Exception as exc:
+            print(f"[{source_name}] 跳过无法验证的配置: {exc}", flush=True)
+            return None
+
+    candidates: list[dict[str, Any]] = []
+    if records:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(EXTERNAL_SOURCE_WORKERS, len(records))
+        ) as executor:
+            for node in executor.map(download, records):
+                if node:
+                    candidates.append(node)
+
+    discovery_countries = normalize_discovery_countries(
+        load_ui_config().get("discovery_countries")
+    )
+    return filter_candidates_by_discovery_countries(candidates, discovery_countries)
+
+
+def fetch_candidates() -> list[dict[str, Any]]:
+    # Preserve the original fetch/state semantics when only VPNGate is enabled.
+    # In particular, an empty country-filtered result is valid, not a source failure.
+    if NODE_SOURCES == {"vpngate"}:
+        return fetch_vpngate_candidates()
+
+    pools: list[list[dict[str, Any]]] = []
+    errors: list[str] = []
+    source_counts: dict[str, int] = {}
+
+    if "vpngate" in NODE_SOURCES:
+        try:
+            pool = fetch_vpngate_candidates()
+            pools.append(pool)
+            source_counts["vpngate"] = len(pool)
+        except Exception as exc:
+            errors.append(f"vpngate={exc}")
+
+    for source_name in ("ipspeed", "vpngate_scraper"):
+        if source_name not in NODE_SOURCES:
+            continue
+        try:
+            pool = fetch_external_candidates(source_name)
+            pools.append(pool)
+            source_counts[source_name] = len(pool)
+        except Exception as exc:
+            errors.append(f"{source_name}={exc}")
+            print(f"[多来源] {source_name} 拉取失败: {exc}", flush=True)
+            log_to_json("WARNING", "Main", f"节点源 {source_name} 拉取失败: {exc}")
+
+    merged = merge_candidate_pools(pools)
+    if not merged:
+        detail = "; ".join(errors) or "没有启用节点来源"
+        raise RuntimeError(f"全部已启用节点源均未产生候选: {detail}")
+
+    summary = ", ".join(f"{name}={count}" for name, count in source_counts.items())
+    message = f"多来源拉取完成：合并去重后 {len(merged)} 个候选（{summary}）"
+    set_state(
+        last_fetch_at=time.time(),
+        last_fetch_status="ok",
+        last_fetch_source=",".join(source_counts),
+        last_fetch_message=message,
+    )
+    log_to_json("INFO", "Main", message)
+    return merged
 
 def cached_nodes() -> list[dict[str, Any]]:
     return read_nodes()

@@ -81,6 +81,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/keqin3/aimili-vpngate/main/u
 
 本分支默认设置 `MAX_SCAN_ROWS=0`，含义是读取 VPNGate 快照返回的全部候选，不再截断前 300/1000 条；实际住宅节点数量仍取决于上游当时提供的节点和 IP 情报接口可用性。
 
+本分支还会并行聚合 `vpngate`、`ipspeed` 和 `vpngate_scraper` 三个 OpenVPN 兼容来源。不同来源可能包含同一台 VPNGate 志愿节点，程序会按 `remote host + port + protocol` 去重；增加的是抓取覆盖率和故障切换能力，不会把重复镜像伪装成新的独立住宅池。外部 `.ovpn` 会经过 HTTPS 主机白名单、响应大小限制和安全指令校验后才进入候选队列。
+
+源码安装可在 `/etc/default/aimilivpn` 调整来源与单次外部配置下载上限：
+
+```bash
+sudo tee /etc/default/aimilivpn >/dev/null <<'EOF'
+NODE_SOURCES=vpngate,ipspeed,vpngate_scraper
+EXTERNAL_SOURCE_MAX_PROFILES=300
+EOF
+sudo systemctl restart aimilivpn
+```
+
+`EXTERNAL_SOURCE_MAX_PROFILES=0` 表示外部来源不设条数上限，但会显著增加下载、验证和探测耗时；通常先用 `300`，确认服务器带宽和 CPU 余量后再提高。只使用原始来源时可设 `NODE_SOURCES=vpngate`。
+
 安装器会部署到 `/opt/aimilivpn` 并注册系统服务。常用命令：
 
 ```bash

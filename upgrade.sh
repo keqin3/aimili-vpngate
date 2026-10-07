@@ -52,4 +52,4 @@ else
     echo "警告: 未检测到 systemd/OpenRC，请手动启动 ${INSTALL_DIR}/vpngate_manager.py" >&2
 fi
 
-echo "升级完成。节点扫描上限 MAX_SCAN_ROWS=0 表示读取 VPNGate 返回的全部候选。"
+echo "升级完成。默认聚合 vpngate、ipspeed、vpngate_scraper；MAX_SCAN_ROWS=0 表示 VPNGate 主快照不限条数。"

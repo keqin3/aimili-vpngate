@@ -15,6 +15,7 @@ from unittest import mock
 
 import proxy_server
 import snapshot_utils
+import node_sources
 
 _import_data_dir = tempfile.TemporaryDirectory()
 _original_data_dir = os.environ.get("VPNGATE_DATA_DIR")
@@ -91,6 +92,7 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
             mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
             mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
+            mock.patch.object(manager, "NODE_SOURCES", {"vpngate"}),
         ]
         for patcher in self.path_patches:
             patcher.start()
@@ -114,6 +116,52 @@ class ManagerLogicTests(unittest.TestCase):
         for patcher in reversed(self.path_patches):
             patcher.stop()
         self.temp_dir.cleanup()
+
+    def test_ipspeed_source_parser_extracts_profiles(self) -> None:
+        html = """
+        <table><tr><th>#</th><th>LOCATION</th><th>FILE</th><th>UPTIME</th><th>PING</th></tr>
+        <tr><td>1</td><td>Japan</td><td><a href="/ovpn/203.0.113.10.ovpn">config</a></td><td>2 days</td><td>17 ms</td></tr>
+        <tr><td>2</td><td>South Korea</td><td><a href="https://ipspeed.info/ovpn/203.0.113.11.ovpn">config</a></td><td>1 day</td><td>31 ms</td></tr></table>
+        """
+        rows = node_sources.parse_ipspeed_index(html, "https://ipspeed.info/free-openvpn.php")
+        self.assertEqual(2, len(rows))
+        self.assertEqual("JP", rows[0]["country_short"])
+        self.assertEqual(17, rows[0]["ping"])
+        self.assertEqual("KR", rows[1]["country_short"])
+
+    def test_vpngate_scraper_parser_extracts_profiles(self) -> None:
+        markdown = "| vpn123 | 203.0.113.12 | 26 | 12.50 Mbps | Korea Republic of | [Download](./configs/server_1_KR.ovpn) |"
+        rows = node_sources.parse_vpngate_scraper_readme(
+            markdown,
+            "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/",
+        )
+        self.assertEqual(1, len(rows))
+        self.assertEqual("KR", rows[0]["country_short"])
+        self.assertEqual(12.5, rows[0]["speed_mbps"])
+        self.assertTrue(rows[0]["profile_url"].endswith("/configs/server_1_KR.ovpn"))
+
+    def test_multi_source_merge_deduplicates_endpoint(self) -> None:
+        first = {"remote_host": "203.0.113.20", "remote_port": 1194, "proto": "udp", "source": "vpngate"}
+        duplicate = {"remote_host": "203.0.113.20", "remote_port": 1194, "proto": "udp4", "source": "ipspeed"}
+        extra = {"remote_host": "203.0.113.20", "remote_port": 443, "proto": "tcp-client", "source": "vpngate_scraper"}
+        merged = manager.merge_candidate_pools([[first], [duplicate, extra]])
+        self.assertEqual([first, extra], merged)
+
+    def test_multi_source_fetch_keeps_working_when_one_source_fails(self) -> None:
+        vpn = {"remote_host": "203.0.113.30", "remote_port": 1194, "proto": "udp"}
+        extra = {"remote_host": "203.0.113.31", "remote_port": 443, "proto": "tcp"}
+
+        def fake_external(name: str) -> list[dict]:
+            if name == "ipspeed":
+                return [extra]
+            raise RuntimeError("offline")
+
+        with mock.patch.object(manager, "NODE_SOURCES", {"vpngate", "ipspeed", "vpngate_scraper"}), \
+             mock.patch.object(manager, "fetch_vpngate_candidates", return_value=[vpn]), \
+             mock.patch.object(manager, "fetch_external_candidates", side_effect=fake_external):
+            nodes = manager.fetch_candidates()
+        self.assertEqual([vpn, extra], nodes)
+        self.assertIn("ipspeed=1", manager.get_state()["last_fetch_message"])
 
     def write_nodes(self, count: int) -> list[dict]:
         nodes = []
