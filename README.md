@@ -81,14 +81,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/keqin3/aimili-vpngate/main/u
 
 本分支默认设置 `MAX_SCAN_ROWS=0`，含义是读取 VPNGate 快照返回的全部候选，不再截断前 300/1000 条；实际住宅节点数量仍取决于上游当时提供的节点和 IP 情报接口可用性。
 
-本分支还会并行聚合 `vpngate`、`ipspeed` 和 `vpngate_scraper` 三个 OpenVPN 兼容来源。不同来源可能包含同一台 VPNGate 志愿节点，程序会按 `remote host + port + protocol` 去重；增加的是抓取覆盖率和故障切换能力，不会把重复镜像伪装成新的独立住宅池。外部 `.ovpn` 会经过 HTTPS 主机白名单、响应大小限制和安全指令校验后才进入候选队列。
+本分支还会并行聚合 `vpngate`、`ipspeed`、`vpngate_scraper` 和持续自动更新的 `auto_ovpn` 四个 OpenVPN 兼容来源。不同来源可能包含同一台 VPNGate 志愿节点，程序会按 `remote host + port + protocol` 去重；增加的是抓取覆盖率、更新及时性和故障切换能力，不会把重复镜像伪装成新的独立住宅池。外部 `.ovpn` 会经过 HTTPS 主机白名单、响应大小限制和安全指令校验后才进入候选队列。
 
 源码安装可在 `/etc/default/aimilivpn` 调整来源与单次外部配置下载上限：
 
 ```bash
 sudo tee /etc/default/aimilivpn >/dev/null <<'EOF'
-NODE_SOURCES=vpngate,ipspeed,vpngate_scraper
+NODE_SOURCES=vpngate,ipspeed,vpngate_scraper,auto_ovpn
 EXTERNAL_SOURCE_MAX_PROFILES=300
+AUTO_PRUNE_FAILED_NODES=1
+AUTO_PRUNE_FAILURE_THRESHOLD=2
 EOF
 sudo systemctl restart aimilivpn
 ```
@@ -195,10 +197,11 @@ docker exec aimilivpn cat /data/ui_auth.json
 ### 2. 获取并连接节点
 
 1. 登录后台，等待首次节点加载完成，或点击“更新节点”。
-2. 点击“一键实测全部”可在后台分批测试当前池中的所有节点；面板会实时显示进度、可用数、不可用数、本机 ICMP/TCP 延迟和 OpenVPN 完整握手耗时。也可使用每行“检测”按钮单独复测。
-3. 点击目标节点的“切换”；目标预检失败时，程序会尽量保留当前可用连接。
-4. 根据需要选择智能自动、固定国家或固定 IP 模式。
-5. 在状态区域确认 VPN 已连接，并核对当前出口 IP。
+2. 点击“一键实测全部”可在后台分批测试当前池中的所有节点；面板会实时显示进度、可用数、不可用数、本机 ICMP/TCP 延迟和 OpenVPN 完整握手耗时。测速结果默认按低延迟从小到大排列，也可切换为握手耗时、来源评分或国家排序。也可使用每行“检测”按钮单独复测。
+3. “批量删除失效”会删除所有已确认握手失败且当前未连接的节点，并临时加入黑名单，避免下一轮马上重新导入。默认连续两轮完整实测失败会自动清理；收藏节点不会被自动清理。可用 `AUTO_PRUNE_FAILED_NODES=0` 关闭，或用 `AUTO_PRUNE_FAILURE_THRESHOLD` 调整连续失败阈值。
+4. 点击目标节点的“切换”；目标预检失败时，程序会尽量保留当前可用连接。
+5. 根据需要选择智能自动、固定国家或固定 IP 模式。
+6. 在状态区域确认 VPN 已连接，并核对当前出口 IP。
 
 “一键实测全部”执行的是实际 OpenVPN 配置握手，不再把上游公示 Ping 冒充本机实测结果。它用于判断节点能否从当前 VPS 完成连接及比较链路时延，不会对每个公益节点持续下载大文件，因此不等同于带宽跑满测试。
 

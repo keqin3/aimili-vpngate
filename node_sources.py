@@ -132,14 +132,18 @@ SCRAPER_ROW_RE = re.compile(
 )
 
 
-def parse_vpngate_scraper_readme(markdown: str, raw_base_url: str) -> list[dict[str, Any]]:
+def parse_vpngate_scraper_readme(
+    markdown: str,
+    raw_base_url: str,
+    source_name: str = "vpngate_scraper",
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for match in SCRAPER_ROW_RE.finditer(markdown):
         hostname, ip, ping_text, speed_text, country, profile_ref = match.groups()
         ping_match = re.search(r"\d+", ping_text)
         speed_match = re.search(r"[\d.]+", speed_text)
         rows.append({
-            "source": "vpngate_scraper",
+            "source": source_name,
             "hostname": hostname.strip(),
             "ip": ip.strip(),
             "country": country.strip(),

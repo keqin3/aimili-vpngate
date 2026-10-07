@@ -125,7 +125,7 @@ MIRROR_META_URL = os.environ.get(
 ).strip()
 NODE_SOURCES = {
     item.strip().lower()
-    for item in os.environ.get("NODE_SOURCES", "vpngate,ipspeed,vpngate_scraper").split(",")
+    for item in os.environ.get("NODE_SOURCES", "vpngate,ipspeed,vpngate_scraper,auto_ovpn").split(",")
     if item.strip()
 }
 IPSPEED_INDEX_URL = os.environ.get("IPSPEED_INDEX_URL", "https://ipspeed.info/free-openvpn.php").strip()
@@ -136,6 +136,14 @@ VPNGATE_SCRAPER_README_URL = os.environ.get(
 VPNGATE_SCRAPER_RAW_BASE_URL = os.environ.get(
     "VPNGATE_SCRAPER_RAW_BASE_URL",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/",
+).strip()
+AUTO_OVPN_README_URL = os.environ.get(
+    "AUTO_OVPN_README_URL",
+    "https://raw.githubusercontent.com/9xN/auto-ovpn/main/README.md",
+).strip()
+AUTO_OVPN_RAW_BASE_URL = os.environ.get(
+    "AUTO_OVPN_RAW_BASE_URL",
+    "https://raw.githubusercontent.com/9xN/auto-ovpn/main/",
 ).strip()
 EXTERNAL_SOURCE_MAX_PROFILES = env_optional_limit("EXTERNAL_SOURCE_MAX_PROFILES", 300)
 EXTERNAL_SOURCE_WORKERS = env_int("EXTERNAL_SOURCE_WORKERS", 6, 1, 12)
@@ -164,6 +172,8 @@ LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
+AUTO_PRUNE_FAILED_NODES = os.environ.get("AUTO_PRUNE_FAILED_NODES", "1").strip().lower() not in {"0", "false", "no", "off"}
+AUTO_PRUNE_FAILURE_THRESHOLD = env_int("AUTO_PRUNE_FAILURE_THRESHOLD", 2, 1, 20)
 DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "source").strip().lower()
 if DEPLOYMENT_MODE not in {"source", "docker"}:
     DEPLOYMENT_MODE = "source"
@@ -967,7 +977,7 @@ def load_blacklist() -> dict[str, dict[str, Any]]:
         write_json(BLACKLIST_FILE, cleaned)
     return cleaned
 
-def mark_blacklisted(node: dict[str, Any], message: str) -> None:
+def mark_blacklisted(node: dict[str, Any], message: str, ttl_seconds: int | None = None) -> None:
     node_id = str(node.get("id") or "").strip()
     if not node_id:
         return
@@ -979,9 +989,88 @@ def mark_blacklisted(node: dict[str, Any], message: str) -> None:
         "country": node.get("country", ""),
         "reason": message,
         "marked_at": now,
-        "until": now + INVALID_BACKOFF_SECONDS,
+        "until": now + (INVALID_BACKOFF_SECONDS if ttl_seconds is None else max(1, ttl_seconds)),
     }
     write_json(BLACKLIST_FILE, blacklist)
+
+
+def apply_probe_health(node: dict[str, Any], result: dict[str, Any]) -> None:
+    """Merge a probe result while tracking repeat failures for safe auto-pruning."""
+    node.update(result)
+    if result.get("probe_status") == "available":
+        node["consecutive_failures"] = 0
+        node.pop("last_failure_at", None)
+    elif result.get("probe_status") == "unavailable":
+        node["consecutive_failures"] = parse_int(node.get("consecutive_failures")) + 1
+        node["last_failure_at"] = float(result.get("probed_at") or time.time())
+
+
+def _remove_managed_config_file(node: dict[str, Any]) -> None:
+    raw_path = str(node.get("config_file") or "").strip()
+    if not raw_path:
+        return
+    try:
+        path = Path(raw_path).resolve()
+        config_root = CONFIG_DIR.resolve()
+        if path.parent == config_root and path.suffix.lower() == ".ovpn" and path.exists():
+            path.unlink()
+    except OSError as exc:
+        print(f"[节点清理] 无法删除配置文件 {raw_path}: {exc}", flush=True)
+
+
+def delete_unavailable_nodes(
+    node_ids: list[str] | None = None,
+    *,
+    min_failures: int = 0,
+    preserve_favorites: bool = False,
+    reason: str = "手动批量删除失效节点",
+) -> dict[str, Any]:
+    """Delete failed, inactive nodes and temporarily blacklist them against immediate re-import."""
+    requested = None if node_ids is None else {str(node_id or "").strip() for node_id in node_ids}
+    if requested is not None:
+        requested.discard("")
+    ui_cfg = load_ui_config()
+    favorite_ids = {str(item) for item in ui_cfg.get("favorite_node_ids", []) if item}
+    removed: list[dict[str, Any]] = []
+
+    with lock:
+        current = read_nodes()
+        kept: list[dict[str, Any]] = []
+        for node in current:
+            node_id = str(node.get("id") or "")
+            eligible = (
+                node.get("probe_status") == "unavailable"
+                and not node.get("active")
+                and node_id != active_openvpn_node_id
+                and parse_int(node.get("consecutive_failures")) >= max(0, min_failures)
+                and (requested is None or node_id in requested)
+                and (not preserve_favorites or node_id not in favorite_ids)
+            )
+            if eligible:
+                removed.append(node)
+            else:
+                kept.append(node)
+
+        for node in removed:
+            mark_blacklisted(node, reason)
+            _remove_managed_config_file(node)
+        write_json(NODES_FILE, sort_all_nodes(kept))
+
+        if removed:
+            removed_ids = {str(node.get("id") or "") for node in removed}
+            ui_cfg["favorite_node_ids"] = [
+                item for item in ui_cfg.get("favorite_node_ids", []) if str(item) not in removed_ids
+            ]
+            if str(ui_cfg.get("fixed_node_id") or "") in removed_ids:
+                ui_cfg["fixed_node_id"] = ""
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+
+    return {
+        "deleted": len(removed),
+        "remaining": len(kept),
+        "deleted_ids": [str(node.get("id") or "") for node in removed],
+    }
 
 def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
     ip = row.get("IP", "")
@@ -1309,6 +1398,18 @@ def fetch_external_candidates(source_name: str) -> list[dict[str, Any]]:
             VPNGATE_SCRAPER_RAW_BASE_URL,
         )
         allowed_hosts = {"raw.githubusercontent.com"}
+    elif source_name == "auto_ovpn":
+        records = node_sources.parse_vpngate_scraper_readme(
+            node_sources.fetch_https_text(
+                AUTO_OVPN_README_URL,
+                {"raw.githubusercontent.com"},
+                node_sources.MAX_INDEX_BYTES,
+                EXTERNAL_SOURCE_TIMEOUT_SECONDS,
+            ),
+            AUTO_OVPN_RAW_BASE_URL,
+            source_name="auto_ovpn",
+        )
+        allowed_hosts = {"raw.githubusercontent.com"}
     else:
         raise ValueError(f"不支持的外部节点源: {source_name}")
 
@@ -1367,7 +1468,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
         except Exception as exc:
             errors.append(f"vpngate={exc}")
 
-    for source_name in ("ipspeed", "vpngate_scraper"):
+    for source_name in ("ipspeed", "vpngate_scraper", "auto_ovpn"):
         if source_name not in NODE_SOURCES:
             continue
         try:
@@ -2137,11 +2238,13 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
-            node["latency_ms"] = latency
-            node["handshake_ms"] = handshake_ms
-            node["probe_status"] = "available" if ok else "unavailable"
-            node["probe_message"] = message
-            node["probed_at"] = time.time()
+            apply_probe_health(node, {
+                "latency_ms": latency,
+                "handshake_ms": handshake_ms,
+                "probe_status": "available" if ok else "unavailable",
+                "probe_message": message,
+                "probed_at": time.time(),
+            })
             if ok:
                 for field in IP_ENRICHMENT_FIELDS:
                     value = temp_node.get(field)
@@ -2273,7 +2376,7 @@ def test_multiple_nodes(
                     current_nodes = read_nodes()
                     for current in current_nodes:
                         if current.get("id") == nid:
-                            current.update(result)
+                            apply_probe_health(current, result)
                             break
                     write_json(NODES_FILE, sort_all_nodes(current_nodes))
                 if progress_callback is not None:
@@ -2370,9 +2473,18 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
             available = sum(item.get("probe_status") == "available" for item in results)
             unavailable = completed - available
             stopped = completed < total
+            pruned = 0
+            if AUTO_PRUNE_FAILED_NODES and not stopped:
+                prune_result = delete_unavailable_nodes(
+                    min_failures=AUTO_PRUNE_FAILURE_THRESHOLD,
+                    preserve_favorites=True,
+                    reason=f"连续 {AUTO_PRUNE_FAILURE_THRESHOLD} 次真实握手失败，自动清理",
+                )
+                pruned = int(prune_result.get("deleted", 0) or 0)
             message = (
                 f"全部节点实测{'提前停止' if stopped else '完成'}："
                 f"已测 {completed}/{total}，可用 {available}，不可用 {unavailable}"
+                + (f"，自动清理 {pruned} 个连续失败节点" if pruned else "")
             )
             set_state(
                 bulk_probe_running=False,
@@ -4600,11 +4712,20 @@ INDEX_HTML = r"""<!doctype html>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
     </select>
+    <select id="sort_filter" aria-label="节点排序">
+      <option value="latency_asc">低延迟优先</option>
+      <option value="handshake_asc">握手最快优先</option>
+      <option value="score_desc">来源评分优先</option>
+      <option value="country_asc">国家排序</option>
+    </select>
     <button id="btn_test_all" class="toolbar-btn" type="button" onclick="startAllNodeTest()" style="margin-left: auto; height: 42px; gap: 6px; border-color: rgba(16,185,129,.45); color: #34d399;">
       <svg id="test_all_icon" xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
       </svg>
       <span id="test_all_label">一键实测全部</span>
+    </button>
+    <button id="btn_delete_unavailable" class="toolbar-btn" type="button" onclick="deleteUnavailableNodes()" style="height:42px; gap:6px; border-color:rgba(244,63,94,.45); color:#fb7185;">
+      <span id="delete_unavailable_label">批量删除失效</span>
     </button>
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -5313,7 +5434,7 @@ function clearDiscoveryCountries(event) {
 function getFilteredNodes() {
   const selectedIpType = $("ip_type_filter").value;
   const selectedStatus = $("status_filter").value;
-  return nodes.filter(n => {
+  const filtered = nodes.filter(n => {
     if (!n) return false;
     const countryCode = String(n.country_short || "").trim().toUpperCase();
     if (selectedDiscoveryCountries.size && !selectedDiscoveryCountries.has(countryCode)) {
@@ -5342,6 +5463,27 @@ function getFilteredNodes() {
     }
     return true;
   });
+  const sortMode = $("sort_filter") ? $("sort_filter").value : "latency_asc";
+  const statusRank = n => (n && (n.active || n.probe_status === "available")) ? 0 : (n && n.probe_status === "testing" ? 1 : (n && n.probe_status === "not_checked" ? 2 : 3));
+  const latencyValue = n => {
+    const value = Number(n && n.latency_ms);
+    return value > 0 ? value : Number.MAX_SAFE_INTEGER;
+  };
+  const handshakeValue = n => {
+    const value = Number(n && n.handshake_ms);
+    return value > 0 ? value : Number.MAX_SAFE_INTEGER;
+  };
+  return filtered.sort((a, b) => {
+    const rankDiff = statusRank(a) - statusRank(b);
+    if (rankDiff !== 0) return rankDiff;
+    let diff = 0;
+    if (sortMode === "handshake_asc") diff = handshakeValue(a) - handshakeValue(b);
+    else if (sortMode === "score_desc") diff = Number(b.score || 0) - Number(a.score || 0);
+    else if (sortMode === "country_asc") diff = String(a.country || "").localeCompare(String(b.country || ""));
+    else diff = latencyValue(a) - latencyValue(b);
+    if (diff !== 0) return diff;
+    return String(a.id || "").localeCompare(String(b.id || ""));
+  });
 }
 
 function stableSortNodes() {
@@ -5367,6 +5509,15 @@ function render(){
     $("deployment_mode_label").textContent = `${modeLabel}部署 · 更新通道：main`;
   }
   updateBulkProbeUI();
+  const failedCount = nodes.filter(n => n && n.probe_status === "unavailable" && !n.active).length;
+  const deleteButton = $("btn_delete_unavailable");
+  const deleteLabel = $("delete_unavailable_label");
+  if (deleteLabel) deleteLabel.textContent = failedCount ? `批量删除失效 (${failedCount})` : "批量删除失效";
+  if (deleteButton) {
+    deleteButton.disabled = failedCount === 0 || Boolean(state.bulk_probe_running) || Boolean(state.maintenance_running) || Boolean(state.is_connecting);
+    deleteButton.style.opacity = deleteButton.disabled ? "0.45" : "";
+    deleteButton.style.cursor = deleteButton.disabled ? "not-allowed" : "pointer";
+  }
 
   const activeNode = nodes.find(n => n && n.active);
   
@@ -5773,6 +5924,33 @@ async function startAllNodeTest() {
   }
 }
 
+async function deleteUnavailableNodes() {
+  const failedCount = nodes.filter(n => n && n.probe_status === "unavailable" && !n.active).length;
+  if (!failedCount) {
+    alert("当前没有已确认失效的节点。请先执行一键实测全部。");
+    return;
+  }
+  if (!confirm(`将批量删除 ${failedCount} 个真实握手失败节点，并临时加入黑名单避免马上被重新导入。是否继续？`)) return;
+  const btn = $("btn_delete_unavailable");
+  if (btn) btn.disabled = true;
+  try {
+    const response = await fetchWithTimeout("./api/delete_unavailable_nodes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ all: true })
+    }, 30000);
+    const result = await readJsonResponse(response, "批量删除失效节点失败");
+    if (!response.ok || !result.ok) throw new Error(result.error || "删除失败");
+    await load();
+    alert(`已删除 ${Number(result.deleted) || 0} 个失效节点，剩余 ${Number(result.remaining) || 0} 个。`);
+  } catch (error) {
+    alert("批量删除失败: " + (error.message || "未知错误"));
+  } finally {
+    if (btn) btn.disabled = false;
+    render();
+  }
+}
+
 function refreshButtonBusy(message = "正在后台更新...") {
   const btn = $("refresh");
   if (!btn) return;
@@ -5940,6 +6118,7 @@ document.addEventListener("keydown", event => {
 });
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
+$("sort_filter").onchange=()=>{ currentPage = 1; render(); };
 
 $("refresh").onclick=async()=>{
   refreshButtonBusy("正在启动更新...");
@@ -7553,6 +7732,33 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "running": True, "message": message})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/delete_unavailable_nodes":
+            acquired = False
+            try:
+                payload = self.read_json_body(max_bytes=262144)
+                node_ids = payload.get("ids")
+                if node_ids is not None and not isinstance(node_ids, list):
+                    self.send_json({"ok": False, "error": "节点 ID 列表无效"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if isinstance(node_ids, list) and len(node_ids) > 5000:
+                    self.send_json({"ok": False, "error": "单次最多删除 5000 个节点"}, HTTPStatus.BAD_REQUEST)
+                    return
+                acquired = maintenance_lock.acquire(blocking=False)
+                if not acquired:
+                    self.send_json({"ok": False, "error": "当前正在连接、更新或测速，请稍后再删除"}, HTTPStatus.CONFLICT)
+                    return
+                result = delete_unavailable_nodes(
+                    [str(item or "").strip() for item in node_ids] if isinstance(node_ids, list) else None,
+                    reason="面板批量删除失效节点",
+                )
+                self.send_json({"ok": True, **result})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            finally:
+                if acquired:
+                    maintenance_lock.release()
         elif effective_path == "/api/test_nodes":
             try:
                 payload = self.read_json_body(max_bytes=262144)

@@ -21,8 +21,10 @@ services:
       UI_PORT: "8787"
       LOCAL_PROXY_HOST: "127.0.0.1"
       LOCAL_PROXY_PORT: "7928"
-      NODE_SOURCES: "vpngate,ipspeed,vpngate_scraper"
+      NODE_SOURCES: "vpngate,ipspeed,vpngate_scraper,auto_ovpn"
       EXTERNAL_SOURCE_MAX_PROFILES: "300"
+      AUTO_PRUNE_FAILED_NODES: "1"
+      AUTO_PRUNE_FAILURE_THRESHOLD: "2"
     volumes:
       - aimilivpn-data:/data
     init: true

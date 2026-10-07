@@ -41,6 +41,32 @@ curl -fsSL "${RAW_INSTALL_URL}" -o "${tmp_script}"
 echo "[4/5] 安装或升级 AimiliVPN"
 bash "${tmp_script}" "${REPO_USER}" "${REPO_NAME}"
 
+# Older installs may pin the former three-source list in EnvironmentFile, which
+# would otherwise override the new application default after upgrading.
+env_file="/etc/default/aimilivpn"
+if [ -f "${env_file}" ] && grep -q '^NODE_SOURCES=' "${env_file}" && ! grep '^NODE_SOURCES=' "${env_file}" | grep -q 'auto_ovpn'; then
+    python3 - "${env_file}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+updated = []
+for line in lines:
+    if line.startswith("NODE_SOURCES="):
+        value = line.split("=", 1)[1].strip()
+        quote = value[:1] if value[:1] in {"'", '"'} and value[-1:] == value[:1] else ""
+        raw = value[1:-1] if quote else value
+        items = [item.strip() for item in raw.split(",") if item.strip()]
+        if "auto_ovpn" not in items:
+            items.append("auto_ovpn")
+        value = ",".join(items)
+        line = f"NODE_SOURCES={quote}{value}{quote}"
+    updated.append(line)
+path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+PY
+fi
+
 echo "[5/5] 验证服务"
 if command -v systemctl >/dev/null 2>&1; then
     systemctl restart aimilivpn.service
@@ -52,4 +78,4 @@ else
     echo "警告: 未检测到 systemd/OpenRC，请手动启动 ${INSTALL_DIR}/vpngate_manager.py" >&2
 fi
 
-echo "升级完成。默认聚合 vpngate、ipspeed、vpngate_scraper；MAX_SCAN_ROWS=0 表示 VPNGate 主快照不限条数。"
+echo "升级完成。默认聚合 vpngate、ipspeed、vpngate_scraper、auto_ovpn；测速后低延迟优先，连续两轮失效节点自动清理。"

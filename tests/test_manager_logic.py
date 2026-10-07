@@ -141,6 +141,21 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(12.5, rows[0]["speed_mbps"])
         self.assertTrue(rows[0]["profile_url"].endswith("/configs/server_1_KR.ovpn"))
 
+    def test_auto_ovpn_parser_tags_source_and_builds_raw_profile_url(self) -> None:
+        markdown = "| vpn456 | 198.51.100.40 | 12 | 42.25Mbps | Japan | [Download](./configs/server_4_JP.ovpn) | 9.2 |"
+        rows = node_sources.parse_vpngate_scraper_readme(
+            markdown,
+            "https://raw.githubusercontent.com/9xN/auto-ovpn/main/",
+            source_name="auto_ovpn",
+        )
+        self.assertEqual(1, len(rows))
+        self.assertEqual("auto_ovpn", rows[0]["source"])
+        self.assertEqual("JP", rows[0]["country_short"])
+        self.assertEqual(
+            "https://raw.githubusercontent.com/9xN/auto-ovpn/main/configs/server_4_JP.ovpn",
+            rows[0]["profile_url"],
+        )
+
     def test_multi_source_merge_deduplicates_endpoint(self) -> None:
         first = {"remote_host": "203.0.113.20", "remote_port": 1194, "proto": "udp", "source": "vpngate"}
         duplicate = {"remote_host": "203.0.113.20", "remote_port": 1194, "proto": "udp4", "source": "ipspeed"}
@@ -242,6 +257,34 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(1, state["bulk_probe_available"])
         self.assertEqual(1, state["bulk_probe_unavailable"])
         self.assertFalse(manager.maintenance_lock.locked())
+
+    def test_probe_health_counts_repeat_failures_and_resets_on_success(self) -> None:
+        node = {"id": "node-1", "consecutive_failures": 1}
+        manager.apply_probe_health(node, {"probe_status": "unavailable", "probed_at": 123})
+        self.assertEqual(2, node["consecutive_failures"])
+        self.assertEqual(123, node["last_failure_at"])
+        manager.apply_probe_health(node, {"probe_status": "available", "probed_at": 456})
+        self.assertEqual(0, node["consecutive_failures"])
+        self.assertNotIn("last_failure_at", node)
+
+    def test_delete_unavailable_nodes_preserves_active_and_cleans_favorites(self) -> None:
+        nodes = self.write_nodes(3)
+        nodes[0].update({"probe_status": "unavailable", "consecutive_failures": 1})
+        nodes[1].update({"probe_status": "unavailable", "consecutive_failures": 2, "active": True})
+        nodes[2].update({"probe_status": "available", "consecutive_failures": 0})
+        manager.write_json(manager.NODES_FILE, nodes)
+        cfg = manager.load_ui_config()
+        cfg["favorite_node_ids"] = [nodes[0]["id"], nodes[2]["id"]]
+        manager.write_json(manager.DATA_DIR / "ui_auth.json", cfg)
+
+        result = manager.delete_unavailable_nodes(reason="test cleanup")
+
+        self.assertEqual(1, result["deleted"])
+        remaining_ids = {item["id"] for item in manager.read_nodes()}
+        self.assertNotIn(nodes[0]["id"], remaining_ids)
+        self.assertIn(nodes[1]["id"], remaining_ids)
+        self.assertEqual([nodes[2]["id"]], manager.load_ui_config()["favorite_node_ids"])
+        self.assertIn(nodes[0]["id"], manager.load_blacklist())
 
     def test_ip_classification_separates_proxy_use_from_network_type(self) -> None:
         residential, residential_reason = manager.vpn_utils.classify_ip_type(
@@ -864,6 +907,10 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('id="bulk_test_progress"', manager.INDEX_HTML)
         self.assertIn('./api/test_all_nodes', manager.INDEX_HTML)
         self.assertIn('OpenVPN 真实握手测试', manager.INDEX_HTML)
+        self.assertIn('id="sort_filter"', manager.INDEX_HTML)
+        self.assertIn('value="latency_asc">低延迟优先', manager.INDEX_HTML)
+        self.assertIn('id="btn_delete_unavailable"', manager.INDEX_HTML)
+        self.assertIn('./api/delete_unavailable_nodes', manager.INDEX_HTML)
 
     def test_web_dashboard_has_browser_freeze_safeguards(self) -> None:
         self.assertNotIn("backdrop-filter", manager.LOGIN_HTML)
