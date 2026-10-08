@@ -17,7 +17,7 @@ timestamp="$(date +%Y%m%d-%H%M%S)"
 if [ -d "${INSTALL_DIR}" ]; then
     backup="/opt/aimilivpn-backup-${timestamp}.tar.gz"
     echo "[1/5] 备份当前安装到 ${backup}"
-    tar -C /opt -czf "${backup}" aimilivpn
+    tar -C /opt --exclude="aimilivpn/vpngate_data/*.log" --exclude="aimilivpn/vpngate_data/configs" -czf "${backup}" aimilivpn || true
     chmod 600 "${backup}"
 
     if [ ! -d "${INSTALL_DIR}/.git" ]; then
