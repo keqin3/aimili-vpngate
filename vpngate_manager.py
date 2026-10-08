@@ -581,7 +581,59 @@ def read_public_proxies() -> list[dict[str, Any]]:
 
 
 def read_all_nodes() -> list[dict[str, Any]]:
-    return read_nodes() + read_public_proxies()
+    raw_nodes = read_nodes() + read_public_proxies()
+    ui_cfg = load_ui_config()
+    fav_ids = set(ui_cfg.get("favorite_node_ids", []))
+    history_ids = load_hosting_history()
+    active_id = active_public_proxy_id or active_openvpn_node_id
+
+    residential_and_other = []
+    hosting_nodes = []
+
+    for n in raw_nodes:
+        nid = str(n.get("id") or "")
+        iptype = str(n.get("ip_type") or "").strip().lower()
+        if nid and (nid == active_id or nid in fav_ids):
+            residential_and_other.append(n)
+        elif iptype == "hosting":
+            hosting_nodes.append(n)
+        else:
+            residential_and_other.append(n)
+
+    if len(hosting_nodes) <= HOSTING_KEEP_LIMIT:
+        return residential_and_other + hosting_nodes
+
+    def node_quality_score(n: dict[str, Any]) -> tuple:
+        latency = parse_int(n.get("latency_ms")) or parse_int(n.get("ping")) or 999999
+        if latency <= 0:
+            latency = 999999
+        speed = parse_int(n.get("speed")) or 0
+        score = parse_int(n.get("score")) or 0
+        return (latency, -speed, -score)
+
+    fresh_hosting = [n for n in hosting_nodes if str(n.get("id") or "") not in history_ids]
+    stale_hosting = [n for n in hosting_nodes if str(n.get("id") or "") in history_ids]
+
+    fresh_hosting.sort(key=node_quality_score)
+    stale_hosting.sort(key=node_quality_score)
+
+    # 1. 限制只能获取 200 个机房 IP 候选 (轮换不重复优先)
+    candidate_hosting = (fresh_hosting + stale_hosting)[:HOSTING_CANDIDATE_LIMIT]
+
+    # 2. 从这 200 个机房 IP 中筛选出延迟最低、速度最快的最优 100 个
+    candidate_hosting.sort(key=node_quality_score)
+    selected_hosting = candidate_hosting[:HOSTING_KEEP_LIMIT]
+
+    # 3. 记录已挑选的机房节点 ID 到轮换历史
+    for n in selected_hosting:
+        nid = str(n.get("id") or "")
+        if nid:
+            history_ids.add(nid)
+    if len(fresh_hosting) <= HOSTING_KEEP_LIMIT:
+        history_ids = {str(n.get("id") or "") for n in selected_hosting if n.get("id")}
+    save_hosting_history(history_ids)
+
+    return residential_and_other + selected_hosting
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, active_public_proxy_id, is_connecting
