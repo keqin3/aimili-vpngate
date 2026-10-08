@@ -94,6 +94,9 @@ AUTO_PRUNE_FAILURE_THRESHOLD=2
 PUBLIC_PROXY_REFRESH_SECONDS=3600
 PUBLIC_PROXY_AUTO_TEST_LIMIT=500
 PUBLIC_PROXY_PROBE_WORKERS=20
+HOSTING_CANDIDATE_LIMIT=200
+HOSTING_RETAIN_LIMIT=100
+HOSTING_ROTATION_SECONDS=86400
 EOF
 sudo systemctl restart aimilivpn
 ```
@@ -103,6 +106,8 @@ sudo systemctl restart aimilivpn
 除 OpenVPN 来源外，本分支还独立聚合 **M1noa、maximilianfeix、ProxyScrape、stormsia、HProxy、Databay 和 Geonode** 的公开 HTTP/SOCKS5 候选。它们不会被伪装成 `.ovpn`：程序按 `protocol + host + port` 跨来源去重，通过代理隧道完成 TLS 与真实出口 IP 验证，再使用现有 IP 情报对出口做住宅/移动/机房分类。选择通过检测的公共代理后，本机 `7928` HTTP/SOCKS5 网关会把流量转发到该上游。
 
 `PUBLIC_PROXY_REFRESH_SECONDS` 控制公开池更新周期；`PUBLIC_PROXY_AUTO_TEST_LIMIT` 限制每轮自动实测数量（不是抓取/存储上限）；`PUBLIC_PROXY_PROBE_WORKERS` 控制并发探测数。面板可按“OpenVPN 节点 / 公共 HTTP/SOCKS”筛选，并显示每个候选的传输协议与来源。
+
+机房 IP 使用独立的轻量池策略：每 24 小时重新开放最多 `200` 个候选，对候选执行真实连接测试，然后按照“可用状态 → 实测延迟 → 完整握手耗时 → 来源速度/在线率”保留最快的 `100` 个。普通刷新和面板加载只保留筛选后的 100 个机房节点，住宅/移动节点不受此上限影响。当前活动节点与收藏节点受保护。对应环境变量为 `HOSTING_CANDIDATE_LIMIT`、`HOSTING_RETAIN_LIMIT` 和 `HOSTING_ROTATION_SECONDS`。
 
 > [!WARNING]
 > 公开免费代理由陌生第三方运行，随时可能失效，也可能观察连接元数据和未加密 HTTP 内容；来源标注的“住宅”通常只是 ASN 推断。程序会保留 HTTPS 证书校验并二次验证出口，但这不能把公开代理变成可信线路。不要通过它传输密码、Cookie、支付数据或其他敏感信息。

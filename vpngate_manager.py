@@ -166,6 +166,10 @@ NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
 PUBLIC_PROXY_PROBE_WORKERS = env_int("PUBLIC_PROXY_PROBE_WORKERS", 20, 1, 64)
 PUBLIC_PROXY_REFRESH_SECONDS = env_int("PUBLIC_PROXY_REFRESH_SECONDS", 3600, 300, 86400)
 PUBLIC_PROXY_AUTO_TEST_LIMIT = env_int("PUBLIC_PROXY_AUTO_TEST_LIMIT", 500, 10, 5000)
+HOSTING_CANDIDATE_LIMIT = env_int("HOSTING_CANDIDATE_LIMIT", 200, 1, 2000)
+HOSTING_RETAIN_LIMIT = env_int("HOSTING_RETAIN_LIMIT", 100, 1, 1000)
+HOSTING_ROTATION_SECONDS = env_int("HOSTING_ROTATION_SECONDS", 86400, 3600, 604800)
+HOSTING_RETAIN_LIMIT = min(HOSTING_RETAIN_LIMIT, HOSTING_CANDIDATE_LIMIT)
 PROXY_FAILURE_THRESHOLD = env_int("PROXY_FAILURE_THRESHOLD", 3, 1, 10)
 SWITCH_PREFLIGHT_MAX_AGE_SECONDS = env_int("SWITCH_PREFLIGHT_MAX_AGE_SECONDS", 180, 0, 3600)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
@@ -216,9 +220,6 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
-HOSTING_HISTORY_FILE = DATA_DIR / "hosting_rotation_history.json"
-HOSTING_CANDIDATE_LIMIT = 200
-HOSTING_KEEP_LIMIT = 100
 API_CACHE_FILE = DATA_DIR / "api_snapshot.csv"
 API_CACHE_META_FILE = DATA_DIR / "api_snapshot.meta.json"
 BUNDLED_SNAPSHOT_FILE = ROOT_DIR / "mirror" / "vpngate.csv"
@@ -232,6 +233,7 @@ background_refill_cancel_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
 bulk_probe_thread: threading.Thread | None = None
 auto_residential_thread: threading.Thread | None = None
+hosting_maintenance_thread: threading.Thread | None = None
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 pending_openvpn_process: subprocess.Popen[str] | None = None
@@ -581,59 +583,7 @@ def read_public_proxies() -> list[dict[str, Any]]:
 
 
 def read_all_nodes() -> list[dict[str, Any]]:
-    raw_nodes = read_nodes() + read_public_proxies()
-    ui_cfg = load_ui_config()
-    fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-    history_ids = load_hosting_history()
-    active_id = active_public_proxy_id or active_openvpn_node_id
-
-    residential_and_other = []
-    hosting_nodes = []
-
-    for n in raw_nodes:
-        nid = str(n.get("id") or "")
-        iptype = str(n.get("ip_type") or "").strip().lower()
-        if nid and (nid == active_id or nid in fav_ids):
-            residential_and_other.append(n)
-        elif iptype == "hosting":
-            hosting_nodes.append(n)
-        else:
-            residential_and_other.append(n)
-
-    if len(hosting_nodes) <= HOSTING_KEEP_LIMIT:
-        return residential_and_other + hosting_nodes
-
-    def node_quality_score(n: dict[str, Any]) -> tuple:
-        latency = parse_int(n.get("latency_ms")) or parse_int(n.get("ping")) or 999999
-        if latency <= 0:
-            latency = 999999
-        speed = parse_int(n.get("speed")) or 0
-        score = parse_int(n.get("score")) or 0
-        return (latency, -speed, -score)
-
-    fresh_hosting = [n for n in hosting_nodes if str(n.get("id") or "") not in history_ids]
-    stale_hosting = [n for n in hosting_nodes if str(n.get("id") or "") in history_ids]
-
-    fresh_hosting.sort(key=node_quality_score)
-    stale_hosting.sort(key=node_quality_score)
-
-    # 1. 限制只能获取 200 个机房 IP 候选 (轮换不重复优先)
-    candidate_hosting = (fresh_hosting + stale_hosting)[:HOSTING_CANDIDATE_LIMIT]
-
-    # 2. 从这 200 个机房 IP 中筛选出延迟最低、速度最快的最优 100 个
-    candidate_hosting.sort(key=node_quality_score)
-    selected_hosting = candidate_hosting[:HOSTING_KEEP_LIMIT]
-
-    # 3. 记录已挑选的机房节点 ID 到轮换历史
-    for n in selected_hosting:
-        nid = str(n.get("id") or "")
-        if nid:
-            history_ids.add(nid)
-    if len(fresh_hosting) <= HOSTING_KEEP_LIMIT:
-        history_ids = {str(n.get("id") or "") for n in selected_hosting if n.get("id")}
-    save_hosting_history(history_ids)
-
-    return residential_and_other + selected_hosting
+    return read_nodes() + read_public_proxies()
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, active_public_proxy_id, is_connecting
@@ -703,12 +653,26 @@ def get_state() -> dict[str, Any]:
     state.setdefault("auto_residential_deleted", 0)
     state.setdefault("auto_residential_duplicates", 0)
     state.setdefault("auto_residential_message", "")
-    state.setdefault("public_proxy_count", len(read_public_proxies()))
+    # Avoid reparsing the node files on every status poll.  The fetch/prune paths
+    # keep these counters current, and startup initializes them from disk once.
+    if "public_proxy_count" not in state:
+        state["public_proxy_count"] = len(read_public_proxies())
     state.setdefault("public_proxy_duplicates_removed", 0)
     state.setdefault("public_proxy_source_counts", {})
     state.setdefault("public_proxy_source_errors", [])
     state.setdefault("public_proxy_last_fetch_at", 0)
     state.setdefault("public_proxy_last_message", "")
+    if "hosting_pool_count" not in state:
+        state["hosting_pool_count"] = sum(1 for node in read_all_nodes() if node.get("ip_type") == "hosting")
+    state["hosting_candidate_limit"] = HOSTING_CANDIDATE_LIMIT
+    state["hosting_retain_limit"] = HOSTING_RETAIN_LIMIT
+    state["hosting_rotation_seconds"] = HOSTING_ROTATION_SECONDS
+    state["hosting_maintenance_running"] = bool(hosting_maintenance_thread and hosting_maintenance_thread.is_alive())
+    state.setdefault("hosting_last_run_at", 0)
+    state.setdefault("hosting_next_run_at", 0)
+    state.setdefault("hosting_tested", 0)
+    state.setdefault("hosting_available", 0)
+    state.setdefault("hosting_message", "")
     state["fav_fail_fallback"] = False
     
     return state
@@ -1213,6 +1177,59 @@ def public_proxy_sort_key(node: dict[str, Any]) -> tuple[Any, ...]:
     return status, ip_type, latency, -float(node.get("uptime_percent") or 0), str(node.get("id") or "")
 
 
+def hosting_quality_key(node: dict[str, Any]) -> tuple[Any, ...]:
+    """Rank hosting nodes without running a traffic-heavy download benchmark."""
+    status = str(node.get("probe_status") or "not_checked")
+    status_rank = 0 if node.get("active") or status == "available" else (1 if status == "testing" else (2 if status == "not_checked" else 3))
+    latency = parse_int(node.get("latency_ms")) or parse_int(node.get("ping")) or 999999
+    handshake = parse_int(node.get("handshake_ms")) or 999999
+    speed = parse_int(node.get("speed"))
+    uptime = float(node.get("uptime_percent") or 0)
+    score = parse_int(node.get("score"))
+    return status_rank, latency, handshake, -speed, -uptime, -score, str(node.get("id") or "")
+
+
+def enforce_global_hosting_limit(limit: int = HOSTING_RETAIN_LIMIT) -> dict[str, Any]:
+    """Keep at most the best N hosting nodes across OpenVPN and public proxy pools."""
+    limit = max(1, int(limit))
+    ui_cfg = load_ui_config()
+    protected_ids = {str(item) for item in ui_cfg.get("favorite_node_ids", []) if item}
+    protected_ids.update({active_openvpn_node_id, active_public_proxy_id})
+    protected_ids.discard("")
+    with lock:
+        vpn_nodes = read_nodes()
+        public_nodes = read_public_proxies()
+        combined = [*vpn_nodes, *public_nodes]
+        hosting_nodes = [node for node in combined if str(node.get("ip_type") or "").lower() == "hosting"]
+        protected = [node for node in hosting_nodes if node.get("active") or str(node.get("id") or "") in protected_ids]
+        protected_keys = {str(node.get("id") or "") for node in protected}
+        ranked = sorted(
+            [node for node in hosting_nodes if str(node.get("id") or "") not in protected_keys],
+            key=hosting_quality_key,
+        )
+        keep_ids = set(protected_keys)
+        keep_ids.update(str(node.get("id") or "") for node in ranked[: max(0, limit - len(protected))])
+        trimmed_vpn = [
+            node for node in vpn_nodes
+            if str(node.get("ip_type") or "").lower() != "hosting" or str(node.get("id") or "") in keep_ids
+        ]
+        trimmed_public = [
+            node for node in public_nodes
+            if str(node.get("ip_type") or "").lower() != "hosting" or str(node.get("id") or "") in keep_ids
+        ]
+        removed = len(vpn_nodes) + len(public_nodes) - len(trimmed_vpn) - len(trimmed_public)
+        write_json(NODES_FILE, sort_all_nodes(trimmed_vpn))
+        write_json(PUBLIC_PROXIES_FILE, sorted(trimmed_public, key=public_proxy_sort_key))
+    kept_count = sum(1 for node in [*trimmed_vpn, *trimmed_public] if str(node.get("ip_type") or "").lower() == "hosting")
+    set_state(
+        hosting_pool_count=kept_count,
+        hosting_candidate_limit=HOSTING_CANDIDATE_LIMIT,
+        hosting_retain_limit=HOSTING_RETAIN_LIMIT,
+        hosting_rotation_seconds=HOSTING_ROTATION_SECONDS,
+    )
+    return {"kept": kept_count, "removed": removed, "limit": limit}
+
+
 def deduplicate_public_proxy_nodes(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     unique: dict[str, dict[str, Any]] = {}
     duplicates = 0
@@ -1237,7 +1254,7 @@ def deduplicate_public_proxy_nodes(nodes: list[dict[str, Any]]) -> tuple[list[di
     return sorted(unique.values(), key=public_proxy_sort_key), duplicates
 
 
-def refresh_public_proxy_pool() -> dict[str, Any]:
+def refresh_public_proxy_pool(hosting_limit: int = HOSTING_RETAIN_LIMIT) -> dict[str, Any]:
     fresh, counts, source_duplicates, errors = public_proxy_pool.fetch_all_sources()
     with lock:
         blacklist = load_blacklist()
@@ -1257,14 +1274,17 @@ def refresh_public_proxy_pool() -> dict[str, Any]:
                     node[field] = previous.get(field)
         deduped, stored_duplicates = deduplicate_public_proxy_nodes(fresh)
         write_json(PUBLIC_PROXIES_FILE, deduped)
+    hosting_result = enforce_global_hosting_limit(hosting_limit)
+    stored_count = len(read_public_proxies())
     message = (
-        f"公共代理池更新完成：保留 {len(deduped)}，跨来源去重 {source_duplicates + stored_duplicates}，"
+        f"公共代理池更新完成：保留 {stored_count}，跨来源去重 {source_duplicates + stored_duplicates}，"
+        f"机房节点按上限清理 {hosting_result['removed']}，"
         + "，".join(f"{name}={count}" for name, count in counts.items())
     )
     if errors:
         message += f"；失败源 {len(errors)} 个"
     set_state(
-        public_proxy_count=len(deduped),
+        public_proxy_count=stored_count,
         public_proxy_duplicates_removed=source_duplicates + stored_duplicates,
         public_proxy_source_counts=counts,
         public_proxy_source_errors=errors,
@@ -1273,8 +1293,9 @@ def refresh_public_proxy_pool() -> dict[str, Any]:
     )
     log_to_json("INFO", "Proxy", message)
     return {
-        "count": len(deduped),
+        "count": stored_count,
         "duplicates_removed": source_duplicates + stored_duplicates,
+        "hosting_removed": hosting_result["removed"],
         "source_counts": counts,
         "errors": errors,
         "message": message,
@@ -2265,95 +2286,6 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     return available_nodes + untested_nodes + unavailable_nodes
 
-def load_hosting_history() -> set[str]:
-    with lock:
-        try:
-            if HOSTING_HISTORY_FILE.exists():
-                data = json.loads(HOSTING_HISTORY_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    return set(str(x) for x in data if x)
-        except Exception:
-            pass
-        return set()
-
-def save_hosting_history(history_ids: set[str]) -> None:
-    with lock:
-        try:
-            DATA_DIR.mkdir(exist_ok=True, parents=True)
-            hist_list = list(history_ids)[-2000:]
-            write_json(HOSTING_HISTORY_FILE, hist_list)
-        except Exception:
-            pass
-
-def prune_and_rotate_hosting_nodes(nodes: list[dict[str, Any]], active_id: str = "") -> list[dict[str, Any]]:
-    """
-    当 IP 路由限制为住宅时 (routing_ip_type == residential):
-    1. 限制机房候选最多 200 个 (采用轮换历史，优先选取未见过的新节点实现轮换不重复)
-    2. 从这 200 个机房候选中按“低延迟优先、高速度优先、来源评分高优先”精选保留最优的 100 个
-    3. 完全保留所有住宅 IP、移动 IP 以及当前活动/收藏节点
-    """
-    if not nodes:
-        return []
-    
-    ui_cfg = load_ui_config()
-    if ui_cfg.get("routing_ip_type") != "residential":
-        return nodes
-
-    fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-    history_ids = load_hosting_history()
-
-    residential_or_protected = []
-    unclassified_nodes = []
-    hosting_nodes = []
-
-    for n in nodes:
-        nid = str(n.get("id") or "")
-        iptype = str(n.get("ip_type") or "").strip().lower()
-        
-        if nid and (nid == active_id or nid in fav_ids):
-            residential_or_protected.append(n)
-        elif iptype in ("residential", "mobile"):
-            residential_or_protected.append(n)
-        elif not iptype or iptype == "unknown":
-            unclassified_nodes.append(n)
-        elif iptype == "hosting":
-            hosting_nodes.append(n)
-        else:
-            unclassified_nodes.append(n)
-
-    if len(hosting_nodes) <= HOSTING_KEEP_LIMIT:
-        return residential_or_protected + unclassified_nodes + hosting_nodes
-
-    def node_quality_score(n: dict[str, Any]) -> tuple:
-        latency = parse_int(n.get("latency_ms")) or parse_int(n.get("ping")) or 999999
-        if latency <= 0:
-            latency = 999999
-        speed = parse_int(n.get("speed")) or 0
-        score = parse_int(n.get("score")) or 0
-        return (latency, -speed, -score)
-
-    fresh_hosting = [n for n in hosting_nodes if str(n.get("id") or "") not in history_ids]
-    stale_hosting = [n for n in hosting_nodes if str(n.get("id") or "") in history_ids]
-
-    fresh_hosting.sort(key=node_quality_score)
-    stale_hosting.sort(key=node_quality_score)
-
-    candidate_hosting = (fresh_hosting + stale_hosting)[:HOSTING_CANDIDATE_LIMIT]
-    candidate_hosting.sort(key=node_quality_score)
-    selected_hosting = candidate_hosting[:HOSTING_KEEP_LIMIT]
-
-    for n in selected_hosting:
-        nid = str(n.get("id") or "")
-        if nid:
-            history_ids.add(nid)
-    if len(fresh_hosting) <= HOSTING_KEEP_LIMIT:
-        history_ids = {str(n.get("id") or "") for n in selected_hosting if n.get("id")}
-    save_hosting_history(history_ids)
-
-    print(f"[机房节点轮换与修剪] 总机房节点 {len(hosting_nodes)} -> 候选限制 {len(candidate_hosting)} -> 筛选保留最优 {len(selected_hosting)} 个 (已保留全部 {len(residential_or_protected)} 个住宅IP)", flush=True)
-
-    return residential_or_protected + unclassified_nodes + selected_hosting
-
 def enrich_stored_nodes() -> int:
     """Enrich every listed IP, then merge only metadata into the latest state."""
     with lock:
@@ -2383,8 +2315,8 @@ def enrich_stored_nodes() -> int:
                     current[field] = new_value
                     changed += 1
         if changed:
-            pruned_nodes = prune_and_rotate_hosting_nodes(current_nodes, active_openvpn_node_id)
-            write_json(NODES_FILE, sort_all_nodes(pruned_nodes))
+            write_json(NODES_FILE, sort_all_nodes(current_nodes))
+    enforce_global_hosting_limit(HOSTING_RETAIN_LIMIT)
     return changed
 
 def ip_enrichment_loop() -> None:
@@ -3169,6 +3101,122 @@ def auto_residential_scheduler_loop() -> None:
             log_to_json("ERROR", "Scheduler", f"住宅节点自动整理调度异常: {exc}")
             time.sleep(60)
 
+
+def start_hosting_maintenance() -> tuple[bool, str]:
+    """Refresh up to 200 hosting candidates, benchmark all, then retain the best 100."""
+    global hosting_maintenance_thread, is_connecting
+    if hosting_maintenance_thread is not None and hosting_maintenance_thread.is_alive():
+        return False, "机房节点 24 小时轮换任务已经在运行"
+    if maintenance_lock.locked() or is_connecting:
+        return False, "当前已有连接、更新或测速任务，机房节点轮换稍后重试"
+
+    def worker() -> None:
+        global is_connecting
+        tested = 0
+        available = 0
+        try:
+            # Re-open the candidate window once per day. Normal refreshes keep
+            # the already-selected pool at the smaller retention limit.
+            maintain_valid_nodes(force=False, hosting_limit=HOSTING_CANDIDATE_LIMIT)
+            if not maintenance_lock.acquire(blocking=False):
+                raise RuntimeError("节点维护锁被其他任务占用")
+            with lock:
+                if is_connecting:
+                    maintenance_lock.release()
+                    raise RuntimeError("当前已有连接或测速任务")
+                is_connecting = True
+            try:
+                refresh_public_proxy_pool(hosting_limit=HOSTING_CANDIDATE_LIMIT)
+                enforce_global_hosting_limit(HOSTING_CANDIDATE_LIMIT)
+                candidates = sorted(
+                    [node for node in read_all_nodes() if str(node.get("ip_type") or "").lower() == "hosting"],
+                    key=hosting_quality_key,
+                )[:HOSTING_CANDIDATE_LIMIT]
+                node_ids = [str(node.get("id") or "") for node in candidates if node.get("id")]
+                total = len(node_ids)
+                set_state(
+                    hosting_maintenance_running=True,
+                    hosting_tested=0,
+                    hosting_available=0,
+                    hosting_message=f"正在实测机房候选：0/{total}",
+                    last_check_message=f"正在执行 24 小时机房节点轮换：0/{total}",
+                )
+
+                def progress(completed: int, ok_count: int, _failed: int, _result: dict[str, Any]) -> None:
+                    set_state(
+                        hosting_tested=completed,
+                        hosting_available=ok_count,
+                        hosting_message=f"正在实测机房候选：{completed}/{total}，可用 {ok_count}",
+                    )
+
+                results = test_combined_nodes(node_ids, progress_callback=progress) if node_ids else []
+                tested = len(results)
+                available = sum(item.get("probe_status") == "available" for item in results)
+                selection = enforce_global_hosting_limit(HOSTING_RETAIN_LIMIT)
+                finished = time.time()
+                message = (
+                    f"机房节点 24 小时轮换完成：候选 {total}，已测 {tested}，可用 {available}，"
+                    f"按延迟/握手/速度保留 {selection['kept']}，淘汰 {selection['removed']}"
+                )
+                set_state(
+                    hosting_maintenance_running=False,
+                    hosting_last_run_at=finished,
+                    hosting_next_run_at=finished + HOSTING_ROTATION_SECONDS,
+                    hosting_tested=tested,
+                    hosting_available=available,
+                    hosting_message=message,
+                    last_check_message=message,
+                )
+                log_to_json("INFO", "Hosting", message)
+            finally:
+                with lock:
+                    is_connecting = False
+                maintenance_lock.release()
+        except Exception as exc:
+            try:
+                enforce_global_hosting_limit(HOSTING_RETAIN_LIMIT)
+            except Exception:
+                pass
+            finished = time.time()
+            message = f"机房节点轮换失败: {exc}"
+            set_state(
+                is_connecting=False,
+                hosting_maintenance_running=False,
+                hosting_last_run_at=finished,
+                hosting_next_run_at=finished + HOSTING_ROTATION_SECONDS,
+                hosting_tested=tested,
+                hosting_available=available,
+                hosting_message=message,
+            )
+            log_to_json("ERROR", "Hosting", message)
+
+    hosting_maintenance_thread = threading.Thread(
+        target=worker,
+        name="vpngate-hosting-maintenance",
+        daemon=True,
+    )
+    hosting_maintenance_thread.start()
+    return True, "已启动机房节点 200 进 100 出的测速轮换"
+
+
+def hosting_scheduler_loop() -> None:
+    """Run the fixed hosting pool rotation every 24 hours."""
+    while True:
+        try:
+            current = get_state()
+            next_run = float(current.get("hosting_next_run_at") or 0)
+            now = time.time()
+            if next_run <= 0:
+                set_state(hosting_next_run_at=now + 60)
+            elif now >= next_run:
+                started, message = start_hosting_maintenance()
+                if not started:
+                    set_state(hosting_message=message)
+            time.sleep(30)
+        except Exception as exc:
+            log_to_json("ERROR", "Scheduler", f"机房节点轮换调度异常: {exc}")
+            time.sleep(60)
+
 def cancel_background_refill() -> None:
     background_refill_cancel_event.set()
 
@@ -3575,7 +3623,7 @@ def connect_node(node_id: str) -> str:
         finish_connection_attempt(token, cancel_event)
         set_state(pending_node_id="")
 
-def maintain_valid_nodes(force: bool = False) -> str:
+def maintain_valid_nodes(force: bool = False, hosting_limit: int = HOSTING_RETAIN_LIMIT) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
     if not maintenance_lock.acquire(blocking=False):
@@ -3680,9 +3728,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     except Exception:
                         pass
                         
-            merged = prune_and_rotate_hosting_nodes(merged, active_openvpn_node_id)
             write_json(NODES_FILE, merged)
             ip_enrichment_wakeup.set()
+
+        enforce_global_hosting_limit(hosting_limit)
 
         initial_tested_ids: set[str] = set()
         fast_results: list[dict[str, Any]] = []
@@ -5588,6 +5637,7 @@ INDEX_HTML = r"""<!doctype html>
       <button id="btn_save_auto_residential" class="toolbar-btn" type="button" onclick="saveAutoResidentialMaintenance()" style="height:38px; color:#22d3ee; border-color:rgba(34,211,238,.4);">保存设置</button>
       <button id="btn_run_auto_residential" class="toolbar-btn" type="button" onclick="runAutoResidentialMaintenanceNow()" style="height:38px; color:#34d399; border-color:rgba(16,185,129,.4);">立即整理一次</button>
       <span id="auto_residential_status" style="flex:1 1 320px; min-width:240px; font-size:12px; line-height:1.6; color:var(--text-secondary);">自动整理未启用</span>
+      <span id="hosting_rotation_status" style="flex-basis:100%; font-size:12px; line-height:1.6; color:#fbbf24;">机房池：最多抓取 200 个，实测后保留最快 100 个，每 24 小时轮换。</span>
     </div>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
@@ -6776,6 +6826,17 @@ function updateAutoResidentialUI() {
   } else {
     status.textContent = "自动整理未启用；启用后会定时更新多来源公共池、跨源去重、真实出口测速、低延迟排序并删除连续失效节点。收藏节点和当前活动节点不会被自动删除。";
     status.style.color = "var(--text-secondary)";
+  }
+  const hostingStatus = $("hosting_rotation_status");
+  if (hostingStatus) {
+    const hostingRunning = Boolean(state.hosting_maintenance_running);
+    const poolCount = Number(state.hosting_pool_count) || 0;
+    const candidateLimit = Number(state.hosting_candidate_limit) || 200;
+    const retainLimit = Number(state.hosting_retain_limit) || 100;
+    hostingStatus.textContent = hostingRunning
+      ? (state.hosting_message || `正在从最多 ${candidateLimit} 个机房候选中筛选最快 ${retainLimit} 个…`)
+      : `机房池 ${poolCount}/${retainLimit}：最多抓取 ${candidateLimit} 个，按实测延迟、握手耗时和来源速度保留最快 ${retainLimit} 个；下次轮换：${formatScheduleTime(state.hosting_next_run_at)}`;
+    hostingStatus.style.color = hostingRunning ? "#34d399" : "#fbbf24";
   }
 }
 
@@ -8563,11 +8624,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 if routing_ip_type == "residential":
-                    with lock:
-                        cur_nodes = read_nodes()
-                        pruned_cur = prune_and_rotate_hosting_nodes(cur_nodes, active_openvpn_node_id)
-                        if len(pruned_cur) != len(cur_nodes):
-                            write_json(NODES_FILE, sort_all_nodes(pruned_cur))
+                    enforce_global_hosting_limit(HOSTING_RETAIN_LIMIT)
                 if routing_mode == "favorites":
                     ui_cfg["fav_fail_fallback"] = False
                 if routing_mode == "fixed_ip":
@@ -8942,6 +8999,9 @@ def main() -> None:
     previous_next_run = float(previous_runtime_state.get("auto_residential_next_run_at") or 0) if isinstance(previous_runtime_state, dict) else 0
     if auto_enabled and previous_next_run <= 0:
         previous_next_run = time.time() + auto_interval
+    previous_hosting_next_run = float(previous_runtime_state.get("hosting_next_run_at") or 0) if isinstance(previous_runtime_state, dict) else 0
+    if previous_hosting_next_run <= time.time():
+        previous_hosting_next_run = time.time() + 60
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -8984,8 +9044,24 @@ def main() -> None:
             "public_proxy_source_errors": previous_runtime_state.get("public_proxy_source_errors", []) if isinstance(previous_runtime_state, dict) else [],
             "public_proxy_last_fetch_at": previous_runtime_state.get("public_proxy_last_fetch_at", 0) if isinstance(previous_runtime_state, dict) else 0,
             "public_proxy_last_message": previous_runtime_state.get("public_proxy_last_message", "") if isinstance(previous_runtime_state, dict) else "",
+            "hosting_pool_count": sum(1 for node in read_all_nodes() if node.get("ip_type") == "hosting"),
+            "hosting_candidate_limit": HOSTING_CANDIDATE_LIMIT,
+            "hosting_retain_limit": HOSTING_RETAIN_LIMIT,
+            "hosting_rotation_seconds": HOSTING_ROTATION_SECONDS,
+            "hosting_maintenance_running": False,
+            "hosting_last_run_at": previous_runtime_state.get("hosting_last_run_at", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "hosting_next_run_at": previous_hosting_next_run,
+            "hosting_tested": previous_runtime_state.get("hosting_tested", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "hosting_available": previous_runtime_state.get("hosting_available", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "hosting_message": previous_runtime_state.get("hosting_message", "") if isinstance(previous_runtime_state, dict) else "",
         },
     )
+    # Trim persisted data before the web service starts so the first dashboard
+    # request does not have to serialize thousands of unwanted hosting rows.
+    try:
+        enforce_global_hosting_limit(HOSTING_RETAIN_LIMIT)
+    except Exception as exc:
+        log_to_json("ERROR", "Hosting", f"启动时修剪机房节点失败: {exc}")
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
     
     # Wait for the gateway to officially start
@@ -9036,6 +9112,7 @@ def main() -> None:
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     threading.Thread(target=auto_residential_scheduler_loop, daemon=True).start()
+    threading.Thread(target=hosting_scheduler_loop, daemon=True).start()
     threading.Thread(target=public_proxy_collector_loop, daemon=True).start()
     
     ui_cfg = load_ui_config()

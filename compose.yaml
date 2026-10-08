@@ -28,6 +28,9 @@ services:
       PUBLIC_PROXY_REFRESH_SECONDS: "3600"
       PUBLIC_PROXY_AUTO_TEST_LIMIT: "500"
       PUBLIC_PROXY_PROBE_WORKERS: "20"
+      HOSTING_CANDIDATE_LIMIT: "200"
+      HOSTING_RETAIN_LIMIT: "100"
+      HOSTING_ROTATION_SECONDS: "86400"
     volumes:
       - aimilivpn-data:/data
     init: true

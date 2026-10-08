@@ -111,6 +111,7 @@ class ManagerLogicTests(unittest.TestCase):
         manager.background_refill_thread = None
         manager.bulk_probe_thread = None
         manager.auto_residential_thread = None
+        manager.hosting_maintenance_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
 
@@ -211,6 +212,48 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(node["id"], manager.active_public_proxy_id)
         self.assertEqual(node["id"], proxy_server.get_active_upstream()["id"])
         self.assertFalse(manager.connection_attempt_lock.locked())
+
+    def test_global_hosting_limit_keeps_fastest_and_preserves_residential_and_active(self) -> None:
+        nodes = self.write_nodes(12)
+        for index, node in enumerate(nodes):
+            node.update({
+                "ip_type": "hosting" if index < 10 else "residential",
+                "probe_status": "available",
+                "latency_ms": index + 1,
+            })
+        nodes[9]["active"] = True
+        manager.active_openvpn_node_id = nodes[9]["id"]
+        manager.write_json(manager.NODES_FILE, nodes)
+
+        result = manager.enforce_global_hosting_limit(4)
+
+        stored = manager.read_nodes()
+        hosting_ids = {node["id"] for node in stored if node.get("ip_type") == "hosting"}
+        self.assertEqual(4, len(hosting_ids))
+        self.assertIn(nodes[9]["id"], hosting_ids)
+        self.assertTrue({nodes[0]["id"], nodes[1]["id"], nodes[2]["id"]}.issubset(hosting_ids))
+        self.assertEqual(2, sum(node.get("ip_type") == "residential" for node in stored))
+        self.assertEqual(4, result["kept"])
+
+    def test_public_refresh_caps_hosting_pool_at_retention_limit(self) -> None:
+        fresh = []
+        for index in range(130):
+            node = public_proxy_pool.normalize_record(
+                {"ip": f"198.51.100.{(index % 250) + 1}", "port": 10000 + index, "protocol": "http", "hosting": True},
+                "feed",
+            )
+            node["latency_ms"] = index + 1
+            fresh.append(node)
+        with (
+            mock.patch.object(public_proxy_pool, "fetch_all_sources", return_value=(fresh, {"feed": 130}, 0, [])),
+            mock.patch.object(manager, "load_blacklist", return_value={}),
+            mock.patch.object(manager, "log_to_json"),
+            mock.patch.object(manager, "HOSTING_RETAIN_LIMIT", 100),
+        ):
+            result = manager.refresh_public_proxy_pool(hosting_limit=100)
+        stored = manager.read_public_proxies()
+        self.assertEqual(100, sum(node.get("ip_type") == "hosting" for node in stored))
+        self.assertEqual(100, result["count"])
 
     def test_ipspeed_source_parser_extracts_profiles(self) -> None:
         html = """
