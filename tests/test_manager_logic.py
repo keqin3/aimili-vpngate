@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 import proxy_server
+import public_proxy_pool
 import snapshot_utils
 import node_sources
 
@@ -84,6 +85,7 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "DATA_DIR", root),
             mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
             mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "PUBLIC_PROXIES_FILE", root / "public_proxies.json"),
             mock.patch.object(manager, "STATE_FILE", root / "state.json"),
             mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
             mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
@@ -100,6 +102,8 @@ class ManagerLogicTests(unittest.TestCase):
         manager.active_openvpn_process = None
         manager.pending_openvpn_process = None
         manager.active_openvpn_node_id = ""
+        manager.active_public_proxy_id = ""
+        proxy_server.set_active_upstream(None)
         manager.active_connection_cancel_event = None
         manager.is_connecting = False
         manager.consecutive_proxy_failures = 0
@@ -118,6 +122,95 @@ class ManagerLogicTests(unittest.TestCase):
         for patcher in reversed(self.path_patches):
             patcher.stop()
         self.temp_dir.cleanup()
+
+    def test_public_proxy_normalization_and_cross_source_dedup(self) -> None:
+        first = public_proxy_pool.normalize_record(
+            {"ip": "203.0.113.44", "port": 8080, "protocol": "http", "country_code": "US"},
+            "first",
+        )
+        duplicate = public_proxy_pool.normalize_record(
+            {"proxy": "http://203.0.113.44:8080", "protocol": "https", "isp": "Example ISP"},
+            "second",
+        )
+        socks = public_proxy_pool.normalize_record(
+            {"proxy": "socks5://203.0.113.44:1080"},
+            "third",
+        )
+        merged, duplicate_count = public_proxy_pool.merge_proxy_records([[first], [duplicate, socks]])
+        self.assertEqual(2, len(merged))
+        self.assertEqual(1, duplicate_count)
+        self.assertEqual(["first", "second"], merged[0]["sources"])
+        self.assertEqual("Example ISP", merged[0]["owner"])
+
+    def test_refresh_public_pool_preserves_probe_state_and_filters_blacklist(self) -> None:
+        old = public_proxy_pool.normalize_record(
+            {"ip": "203.0.113.45", "port": 8080, "protocol": "http"}, "old"
+        )
+        old.update({"probe_status": "available", "latency_ms": 42, "exit_ip": "198.51.100.8"})
+        blocked = public_proxy_pool.normalize_record(
+            {"ip": "203.0.113.46", "port": 1080, "protocol": "socks5"}, "blocked"
+        )
+        manager.write_json(manager.PUBLIC_PROXIES_FILE, [old])
+        with (
+            mock.patch.object(public_proxy_pool, "fetch_all_sources", return_value=([old.copy(), blocked], {"feed": 2}, 1, [])),
+            mock.patch.object(manager, "load_blacklist", return_value={blocked["id"]: {"until": 9999999999}}),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            result = manager.refresh_public_proxy_pool()
+        stored = manager.read_public_proxies()
+        self.assertEqual(1, len(stored))
+        self.assertEqual("available", stored[0]["probe_status"])
+        self.assertEqual(42, stored[0]["latency_ms"])
+        self.assertEqual(1, result["duplicates_removed"])
+
+    def test_public_proxy_single_test_updates_saved_node(self) -> None:
+        node = public_proxy_pool.normalize_record(
+            {"ip": "203.0.113.47", "port": 8080, "protocol": "http"}, "feed"
+        )
+        manager.write_json(manager.PUBLIC_PROXIES_FILE, [node])
+        result = {
+            "id": node["id"], "exit_ip": "198.51.100.9", "latency_ms": 33,
+            "handshake_ms": 33, "probe_status": "available", "probe_message": "ok", "probed_at": 1,
+        }
+        with (
+            mock.patch.object(public_proxy_pool, "probe_proxy", return_value=result),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+        ):
+            updated = manager.test_node_by_id(node["id"])
+        self.assertEqual("available", updated["probe_status"])
+        self.assertEqual("198.51.100.9", updated["exit_ip"])
+        self.assertEqual("203.0.113.47", updated["remote_host"])
+
+    def test_delete_unavailable_public_proxy_blacklists_removed_node(self) -> None:
+        node = public_proxy_pool.normalize_record(
+            {"ip": "203.0.113.48", "port": 1080, "protocol": "socks5"}, "feed"
+        )
+        node.update({"probe_status": "unavailable", "consecutive_failures": 2})
+        manager.write_json(manager.PUBLIC_PROXIES_FILE, [node])
+        with mock.patch.object(manager, "mark_blacklisted") as blacklist:
+            result = manager.delete_unavailable_public_proxies(min_failures=2)
+        self.assertEqual(1, result["deleted"])
+        blacklist.assert_called_once()
+
+    def test_connect_public_proxy_uses_local_gateway_upstream_and_releases_lock(self) -> None:
+        node = public_proxy_pool.normalize_record(
+            {"ip": "203.0.113.49", "port": 8080, "protocol": "http"}, "feed"
+        )
+        manager.write_json(manager.PUBLIC_PROXIES_FILE, [node])
+        probe = {
+            "id": node["id"], "exit_ip": "198.51.100.10", "latency_ms": 21,
+            "handshake_ms": 21, "probe_status": "available", "probe_message": "ok", "probed_at": 1,
+        }
+        with (
+            mock.patch.object(public_proxy_pool, "probe_proxy", return_value=probe),
+            mock.patch.object(manager, "stop_active_openvpn"),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            message = manager.connect_node(node["id"])
+        self.assertIn("HTTP", message)
+        self.assertEqual(node["id"], manager.active_public_proxy_id)
+        self.assertEqual(node["id"], proxy_server.get_active_upstream()["id"])
+        self.assertFalse(manager.connection_attempt_lock.locked())
 
     def test_ipspeed_source_parser_extracts_profiles(self) -> None:
         html = """
@@ -339,7 +432,14 @@ class ManagerLogicTests(unittest.TestCase):
             manager.write_json(manager.NODES_FILE, current)
             return results
 
-        with mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test):
+        with (
+            mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test),
+            mock.patch.object(
+                manager,
+                "refresh_public_proxy_pool",
+                return_value={"duplicates_removed": 0, "message": "ok"},
+            ),
+        ):
             started, _ = manager.start_auto_residential_maintenance(manual=True)
             self.assertTrue(started)
             manager.auto_residential_thread.join(timeout=2)

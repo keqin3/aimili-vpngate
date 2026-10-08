@@ -10,6 +10,8 @@ import urllib.parse
 import time
 from typing import Any
 
+import public_proxy_pool
+
 def parse_positive_int(value: str | None, default: int) -> int:
     try:
         return max(1, int(value or default))
@@ -18,6 +20,19 @@ def parse_positive_int(value: str | None, default: int) -> int:
 
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
+upstream_lock = threading.RLock()
+active_upstream: dict[str, Any] | None = None
+
+
+def set_active_upstream(node: dict[str, Any] | None) -> None:
+    global active_upstream
+    with upstream_lock:
+        active_upstream = dict(node) if node else None
+
+
+def get_active_upstream() -> dict[str, Any] | None:
+    with upstream_lock:
+        return dict(active_upstream) if active_upstream else None
 
 def parse_int(value: Any) -> int:
     try:
@@ -193,6 +208,9 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
+    public_upstream = get_active_upstream()
+    if public_upstream:
+        return public_proxy_pool.open_proxy_tunnel(public_upstream, host, port, timeout=timeout)
     resolved_ip = resolve_dns_over_tun0(host)
     if resolved_ip:
         host = resolved_ip

@@ -91,11 +91,21 @@ NODE_SOURCES=vpngate,ipspeed,vpngate_scraper,auto_ovpn
 EXTERNAL_SOURCE_MAX_PROFILES=300
 AUTO_PRUNE_FAILED_NODES=1
 AUTO_PRUNE_FAILURE_THRESHOLD=2
+PUBLIC_PROXY_REFRESH_SECONDS=3600
+PUBLIC_PROXY_AUTO_TEST_LIMIT=500
+PUBLIC_PROXY_PROBE_WORKERS=20
 EOF
 sudo systemctl restart aimilivpn
 ```
 
 `EXTERNAL_SOURCE_MAX_PROFILES=0` 表示外部来源不设条数上限，但会显著增加下载、验证和探测耗时；通常先用 `300`，确认服务器带宽和 CPU 余量后再提高。只使用原始来源时可设 `NODE_SOURCES=vpngate`。
+
+除 OpenVPN 来源外，本分支还独立聚合 **M1noa、maximilianfeix、ProxyScrape、stormsia、HProxy、Databay 和 Geonode** 的公开 HTTP/SOCKS5 候选。它们不会被伪装成 `.ovpn`：程序按 `protocol + host + port` 跨来源去重，通过代理隧道完成 TLS 与真实出口 IP 验证，再使用现有 IP 情报对出口做住宅/移动/机房分类。选择通过检测的公共代理后，本机 `7928` HTTP/SOCKS5 网关会把流量转发到该上游。
+
+`PUBLIC_PROXY_REFRESH_SECONDS` 控制公开池更新周期；`PUBLIC_PROXY_AUTO_TEST_LIMIT` 限制每轮自动实测数量（不是抓取/存储上限）；`PUBLIC_PROXY_PROBE_WORKERS` 控制并发探测数。面板可按“OpenVPN 节点 / 公共 HTTP/SOCKS”筛选，并显示每个候选的传输协议与来源。
+
+> [!WARNING]
+> 公开免费代理由陌生第三方运行，随时可能失效，也可能观察连接元数据和未加密 HTTP 内容；来源标注的“住宅”通常只是 ASN 推断。程序会保留 HTTPS 证书校验并二次验证出口，但这不能把公开代理变成可信线路。不要通过它传输密码、Cookie、支付数据或其他敏感信息。
 
 安装器会部署到 `/opt/aimilivpn` 并注册系统服务。常用命令：
 
@@ -198,8 +208,8 @@ docker exec aimilivpn cat /data/ui_auth.json
 
 1. 登录后台，等待首次节点加载完成，或点击“更新节点”。
 2. 点击“一键实测全部”可在后台分批测试当前池中的所有节点；面板会实时显示进度、可用数、不可用数、本机 ICMP/TCP 延迟和 OpenVPN 完整握手耗时。测速结果默认按低延迟从小到大排列，也可切换为握手耗时、来源评分或国家排序。也可使用每行“检测”按钮单独复测。
-3. “批量删除失效”会删除所有已确认握手失败且当前未连接的节点，并临时加入黑名单，避免下一轮马上重新导入。默认连续两轮完整实测失败会自动清理；收藏节点不会被自动清理。可用 `AUTO_PRUNE_FAILED_NODES=0` 关闭，或用 `AUTO_PRUNE_FAILURE_THRESHOLD` 调整连续失败阈值。
-4. “自动整理住宅节点”可按 **1 小时、5 小时、10 小时、24 小时或 1 周** 定时执行住宅/移动网络节点的真实握手测速、低延迟排序、失效筛选和安全清理。勾选开关、选择周期后点击“保存设置”即可；“立即整理一次”用于先手动验证流程。当前活动节点和收藏节点不会被自动删除，遇到更新、切换或其他测速任务时会等待空闲后重试。
+3. “批量删除失效”会同时删除 OpenVPN 与公共 HTTP/SOCKS 中已确认真实握手失败、且当前未连接的节点，并临时加入黑名单，避免下一轮马上重新导入。默认连续两轮完整实测失败会自动清理；收藏节点不会被自动清理。可用 `AUTO_PRUNE_FAILED_NODES=0` 关闭，或用 `AUTO_PRUNE_FAILURE_THRESHOLD` 调整连续失败阈值。
+4. “自动整理住宅/公共代理”可按 **1 小时、5 小时、10 小时、24 小时或 1 周** 定时拉取多来源候选、跨来源对比去重、验证真实出口、住宅分类、测速、低延迟排序和清理连续失效节点。勾选开关、选择周期后点击“保存设置”即可；“立即整理一次”用于先手动验证流程。当前活动节点和收藏节点不会被自动删除，遇到更新、切换或其他测速任务时会等待空闲后重试。
 5. 点击目标节点的“切换”；目标预检失败时，程序会尽量保留当前可用连接。
 6. 根据需要选择智能自动、固定国家或固定 IP 模式。
 7. 在状态区域确认 VPN 已连接，并核对当前出口 IP。

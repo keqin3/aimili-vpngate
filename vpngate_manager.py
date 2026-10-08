@@ -62,6 +62,7 @@ import vpn_utils
 import proxy_server
 import snapshot_utils
 import node_sources
+import public_proxy_pool
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -162,6 +163,9 @@ OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 24, 1, 100)
 NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
+PUBLIC_PROXY_PROBE_WORKERS = env_int("PUBLIC_PROXY_PROBE_WORKERS", 20, 1, 64)
+PUBLIC_PROXY_REFRESH_SECONDS = env_int("PUBLIC_PROXY_REFRESH_SECONDS", 3600, 300, 86400)
+PUBLIC_PROXY_AUTO_TEST_LIMIT = env_int("PUBLIC_PROXY_AUTO_TEST_LIMIT", 500, 10, 5000)
 PROXY_FAILURE_THRESHOLD = env_int("PROXY_FAILURE_THRESHOLD", 3, 1, 10)
 SWITCH_PREFLIGHT_MAX_AGE_SECONDS = env_int("SWITCH_PREFLIGHT_MAX_AGE_SECONDS", 180, 0, 3600)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
@@ -207,6 +211,7 @@ GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/r
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
+PUBLIC_PROXIES_FILE = DATA_DIR / "public_proxies.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
@@ -230,6 +235,7 @@ pending_openvpn_process: subprocess.Popen[str] | None = None
 active_connection_cancel_event: threading.Event | None = None
 connection_epoch = 0
 active_openvpn_node_id = ""
+active_public_proxy_id = ""
 is_connecting = False
 last_active_ping_time = 0.0
 last_active_latency = 0
@@ -563,11 +569,25 @@ def read_nodes() -> list[dict[str, Any]]:
         return []
     return [item for item in raw if isinstance(item, dict)]
 
+
+def read_public_proxies() -> list[dict[str, Any]]:
+    raw = read_json(PUBLIC_PROXIES_FILE, [])
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def read_all_nodes() -> list[dict[str, Any]]:
+    return read_nodes() + read_public_proxies()
+
 def get_state() -> dict[str, Any]:
-    global active_openvpn_node_id, is_connecting
+    global active_openvpn_node_id, active_public_proxy_id, is_connecting
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
+    state["active_public_proxy_id"] = active_public_proxy_id
+    state["active_node_id"] = active_public_proxy_id or active_openvpn_node_id
+    state["active_transport"] = "public_proxy" if active_public_proxy_id else ("openvpn" if active_openvpn_node_id else "")
     state["is_connecting"] = is_connecting
     state["maintenance_running"] = maintenance_lock.locked()
     # Runtime truth wins over a stale state.json left by a service restart.
@@ -626,7 +646,14 @@ def get_state() -> dict[str, Any]:
     state.setdefault("auto_residential_available", 0)
     state.setdefault("auto_residential_unavailable", 0)
     state.setdefault("auto_residential_deleted", 0)
+    state.setdefault("auto_residential_duplicates", 0)
     state.setdefault("auto_residential_message", "")
+    state.setdefault("public_proxy_count", len(read_public_proxies()))
+    state.setdefault("public_proxy_duplicates_removed", 0)
+    state.setdefault("public_proxy_source_counts", {})
+    state.setdefault("public_proxy_source_errors", [])
+    state.setdefault("public_proxy_last_fetch_at", 0)
+    state.setdefault("public_proxy_last_message", "")
     state["fav_fail_fallback"] = False
     
     return state
@@ -636,14 +663,22 @@ def safe_name(value: str) -> str:
     return value.strip("._") or "node"
 
 def clear_active_connection_state(message: str) -> None:
+    global active_public_proxy_id
     stop_active_openvpn()
+    proxy_server.set_active_upstream(None)
+    active_public_proxy_id = ""
     with lock:
         nodes = read_nodes()
         for item in nodes:
             item["active"] = False
         write_json(NODES_FILE, nodes)
+        public_nodes = read_public_proxies()
+        for item in public_nodes:
+            item["active"] = False
+        write_json(PUBLIC_PROXIES_FILE, public_nodes)
     set_state(
         active_openvpn_node_id="",
+        active_public_proxy_id="",
         is_connecting=False,
         pending_node_id="",
         active_node_latency="无活动连接",
@@ -1114,6 +1149,188 @@ def delete_unavailable_nodes(
         "remaining": len(kept),
         "deleted_ids": [str(node.get("id") or "") for node in removed],
     }
+
+
+def public_proxy_sort_key(node: dict[str, Any]) -> tuple[Any, ...]:
+    status = 0 if node.get("active") or node.get("probe_status") == "available" else (1 if node.get("probe_status") in {"not_checked", "testing"} else 2)
+    ip_type = 0 if node.get("ip_type") in {"residential", "mobile"} else (1 if node.get("ip_type") == "unknown" else 2)
+    latency = parse_int(node.get("latency_ms")) or 999999
+    return status, ip_type, latency, -float(node.get("uptime_percent") or 0), str(node.get("id") or "")
+
+
+def deduplicate_public_proxy_nodes(nodes: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    unique: dict[str, dict[str, Any]] = {}
+    duplicates = 0
+    for node in nodes:
+        protocol = public_proxy_pool.normalize_protocol(node.get("protocol") or node.get("proto"))
+        host = str(node.get("remote_host") or node.get("ip") or "").strip().lower()
+        port = parse_int(node.get("remote_port") or node.get("port"))
+        if not protocol or not host or not port:
+            continue
+        key = f"{protocol}|{host}|{port}"
+        node["endpoint_key"] = key
+        if key not in unique:
+            unique[key] = node
+            continue
+        duplicates += 1
+        kept = unique[key]
+        kept["sources"] = list(dict.fromkeys([*kept.get("sources", []), *node.get("sources", [])]))
+        if node.get("probe_status") == "available" and kept.get("probe_status") != "available":
+            runtime_sources = kept.get("sources", [])
+            unique[key] = node
+            unique[key]["sources"] = runtime_sources
+    return sorted(unique.values(), key=public_proxy_sort_key), duplicates
+
+
+def refresh_public_proxy_pool() -> dict[str, Any]:
+    fresh, counts, source_duplicates, errors = public_proxy_pool.fetch_all_sources()
+    with lock:
+        blacklist = load_blacklist()
+        fresh = [node for node in fresh if str(node.get("id") or "") not in blacklist]
+        old_by_id = {str(node.get("id") or ""): node for node in read_public_proxies() if node.get("id")}
+        for node in fresh:
+            previous = old_by_id.get(str(node.get("id") or ""))
+            if not previous:
+                continue
+            for field in (
+                "probe_status", "probe_message", "probed_at", "latency_ms", "handshake_ms",
+                "exit_ip", "consecutive_failures", "last_failure_at", "owner", "asn", "as_name",
+                "location", "ip_type", "quality", "is_proxy", "is_hosting", "is_mobile",
+                "ip_type_reason", "ip_type_confidence", "ip_type_sources", "geo_country_short",
+            ):
+                if previous.get(field) not in (None, ""):
+                    node[field] = previous.get(field)
+        deduped, stored_duplicates = deduplicate_public_proxy_nodes(fresh)
+        write_json(PUBLIC_PROXIES_FILE, deduped)
+    message = (
+        f"公共代理池更新完成：保留 {len(deduped)}，跨来源去重 {source_duplicates + stored_duplicates}，"
+        + "，".join(f"{name}={count}" for name, count in counts.items())
+    )
+    if errors:
+        message += f"；失败源 {len(errors)} 个"
+    set_state(
+        public_proxy_count=len(deduped),
+        public_proxy_duplicates_removed=source_duplicates + stored_duplicates,
+        public_proxy_source_counts=counts,
+        public_proxy_source_errors=errors,
+        public_proxy_last_fetch_at=time.time(),
+        public_proxy_last_message=message,
+    )
+    log_to_json("INFO", "Proxy", message)
+    return {
+        "count": len(deduped),
+        "duplicates_removed": source_duplicates + stored_duplicates,
+        "source_counts": counts,
+        "errors": errors,
+        "message": message,
+    }
+
+
+def test_public_proxy_nodes(
+    node_ids: list[str],
+    progress_callback: Callable[[int, int, int, dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    with lock:
+        selected = [node.copy() for node in read_public_proxies() if node.get("id") in node_ids]
+        selected_ids = {str(node.get("id") or "") for node in selected}
+        current = read_public_proxies()
+        now = time.time()
+        for node in current:
+            if node.get("id") in selected_ids and not node.get("active"):
+                node["probe_status"] = "testing"
+                node["probe_message"] = "正在验证代理握手、TLS 和真实出口 IP..."
+                node["probed_at"] = now
+        write_json(PUBLIC_PROXIES_FILE, sorted(current, key=public_proxy_sort_key))
+
+    results: list[dict[str, Any]] = []
+    available = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(PUBLIC_PROXY_PROBE_WORKERS, max(1, len(selected)))) as executor:
+        futures = {executor.submit(public_proxy_pool.probe_proxy, node): node for node in selected}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results.append(result)
+            if result.get("probe_status") == "available":
+                available += 1
+                temp = {"ip": result.get("exit_ip")}
+                try:
+                    vpn_utils.enrich_ip_info([temp])
+                except Exception:
+                    pass
+                for field in IP_ENRICHMENT_FIELDS:
+                    if temp.get(field) not in (None, ""):
+                        result[field] = temp.get(field)
+            with lock:
+                current = read_public_proxies()
+                target = next((node for node in current if node.get("id") == result.get("id")), None)
+                if target:
+                    apply_probe_health(target, result)
+                    write_json(PUBLIC_PROXIES_FILE, sorted(current, key=public_proxy_sort_key))
+            if progress_callback:
+                completed = len(results)
+                progress_callback(completed, available, completed - available, result)
+    return results
+
+
+def test_combined_nodes(
+    node_ids: list[str],
+    progress_callback: Callable[[int, int, int, dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    vpn_ids = {str(node.get("id") or "") for node in read_nodes()}
+    public_ids = {str(node.get("id") or "") for node in read_public_proxies()}
+    ordered = list(dict.fromkeys(str(item or "").strip() for item in node_ids if item))
+    selected_vpn = [node_id for node_id in ordered if node_id in vpn_ids]
+    selected_public = [node_id for node_id in ordered if node_id in public_ids]
+    results: list[dict[str, Any]] = []
+    available = 0
+
+    def bridge(_completed: int, _available: int, _unavailable: int, result: dict[str, Any]) -> None:
+        nonlocal available
+        completed = len(results) + _completed
+        total_available = available + _available
+        if progress_callback:
+            progress_callback(completed, total_available, completed - total_available, result)
+
+    if selected_vpn:
+        vpn_results = test_multiple_nodes(selected_vpn, progress_callback=bridge)
+        results.extend(vpn_results)
+        available += sum(item.get("probe_status") == "available" for item in vpn_results)
+    if selected_public:
+        public_results = test_public_proxy_nodes(selected_public, progress_callback=bridge)
+        results.extend(public_results)
+    return results
+
+
+def delete_unavailable_public_proxies(
+    node_ids: list[str] | None = None,
+    *,
+    min_failures: int = 0,
+    preserve_favorites: bool = False,
+) -> dict[str, Any]:
+    requested = None if node_ids is None else {str(item or "").strip() for item in node_ids}
+    ui_cfg = load_ui_config()
+    favorites = {str(item) for item in ui_cfg.get("favorite_node_ids", []) if item}
+    with lock:
+        kept: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        for node in read_public_proxies():
+            node_id = str(node.get("id") or "")
+            eligible = (
+                node.get("probe_status") == "unavailable"
+                and node_id != active_public_proxy_id
+                and not node.get("active")
+                and parse_int(node.get("consecutive_failures")) >= max(0, min_failures)
+                and (requested is None or node_id in requested)
+                and (not preserve_favorites or node_id not in favorites)
+            )
+            (removed if eligible else kept).append(node)
+        write_json(PUBLIC_PROXIES_FILE, sorted(kept, key=public_proxy_sort_key))
+        if removed:
+            removed_ids = {str(node.get("id") or "") for node in removed}
+            for node in removed:
+                mark_blacklisted(node, "公共代理真实出口检测失败后删除")
+            ui_cfg["favorite_node_ids"] = [item for item in ui_cfg.get("favorite_node_ids", []) if str(item) not in removed_ids]
+            write_json(DATA_DIR / "ui_auth.json", ui_cfg)
+    return {"deleted": len(removed), "remaining": len(kept), "deleted_ids": [node.get("id") for node in removed]}
 
 def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
     ip = row.get("IP", "")
@@ -1951,8 +2168,20 @@ def stop_active_openvpn() -> None:
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
+
+def active_connection_running() -> bool:
+    return active_openvpn_running() or bool(active_public_proxy_id and proxy_server.get_active_upstream())
+
 def connection_ready_for_ui(state: dict[str, Any] | None = None) -> bool:
     current = get_state() if state is None else state
+    if active_public_proxy_id:
+        return bool(
+            proxy_server.get_active_upstream()
+            and current.get("tunnel_ready")
+            and current.get("proxy_ready")
+            and current.get("proxy_ok")
+            and not current.get("is_connecting")
+        )
     return bool(
         active_openvpn_node_id
         and active_openvpn_running()
@@ -2226,6 +2455,12 @@ def test_config_path(node_id: str) -> Path:
     return CONFIG_DIR / f".test_{safe_id}_{uuid.uuid4().hex}.ovpn"
 
 def test_node_by_id(node_id: str) -> dict[str, Any]:
+    if any(str(item.get("id") or "") == node_id for item in read_public_proxies()):
+        results = test_public_proxy_nodes([node_id])
+        if not results:
+            raise ValueError(f"Node not found: {node_id}")
+        updated = next((item for item in read_public_proxies() if item.get("id") == node_id), None)
+        return updated or results[0]
     with lock:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
@@ -2469,7 +2704,7 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
         if is_connecting:
             maintenance_lock.release()
             return False, "当前已有连接或节点维护任务正在运行，请稍后再试"
-        node_ids = [str(node.get("id") or "").strip() for node in read_nodes()]
+        node_ids = [str(node.get("id") or "").strip() for node in read_all_nodes()]
         node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
         if not node_ids:
             maintenance_lock.release()
@@ -2511,7 +2746,7 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
             )
 
         try:
-            results = test_multiple_nodes(node_ids, progress_callback=update_progress)
+            results = test_combined_nodes(node_ids, progress_callback=update_progress)
             completed = len(results)
             available = sum(item.get("probe_status") == "available" for item in results)
             unavailable = completed - available
@@ -2524,6 +2759,11 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
                     reason=f"连续 {AUTO_PRUNE_FAILURE_THRESHOLD} 次真实握手失败，自动清理",
                 )
                 pruned = int(prune_result.get("deleted", 0) or 0)
+                public_prune = delete_unavailable_public_proxies(
+                    min_failures=AUTO_PRUNE_FAILURE_THRESHOLD,
+                    preserve_favorites=True,
+                )
+                pruned += int(public_prune.get("deleted", 0) or 0)
             message = (
                 f"全部节点实测{'提前停止' if stopped else '完成'}："
                 f"已测 {completed}/{total}，可用 {available}，不可用 {unavailable}"
@@ -2621,18 +2861,18 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
         if is_connecting:
             maintenance_lock.release()
             return False, "当前已有连接、更新或测速任务，自动整理稍后重试"
-        node_ids = [
+        vpn_node_ids = [
             str(node.get("id") or "").strip()
             for node in read_nodes()
             if str(node.get("ip_type") or "").lower() in {"residential", "mobile"}
         ]
-        node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
-        if not node_ids:
-            maintenance_lock.release()
-            message = "当前没有已识别的住宅/移动网络节点，请先更新节点并等待 IP 类型识别完成"
-            if manual:
-                set_state(auto_residential_message=message)
-            return False, message
+        public_candidates = [
+            node for node in read_public_proxies()
+            if str(node.get("ip_type") or "").lower() in {"residential", "mobile", "unknown"}
+        ]
+        public_candidates.sort(key=public_proxy_sort_key)
+        public_node_ids = [str(node.get("id") or "") for node in public_candidates[:PUBLIC_PROXY_AUTO_TEST_LIMIT]]
+        node_ids = list(dict.fromkeys(node_id for node_id in [*vpn_node_ids, *public_node_ids] if node_id))
         is_connecting = True
 
     total = len(node_ids)
@@ -2643,8 +2883,9 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
         auto_residential_available=0,
         auto_residential_unavailable=0,
         auto_residential_deleted=0,
-        auto_residential_message=f"正在自动实测住宅节点：0/{total}",
-        last_check_message=f"正在自动实测 {total} 个住宅节点：0/{total}",
+        auto_residential_duplicates=0,
+        auto_residential_message=f"正在更新、去重并准备实测住宅/公共代理节点：0/{total}",
+        last_check_message=f"正在更新、去重并准备实测 {total} 个节点",
     )
 
     def worker() -> None:
@@ -2662,7 +2903,25 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
 
         finished_at = time.time()
         try:
-            results = test_multiple_nodes(node_ids, progress_callback=update_progress)
+            refresh_result = refresh_public_proxy_pool()
+            refreshed_public = [
+                node for node in read_public_proxies()
+                if str(node.get("ip_type") or "").lower() in {"residential", "mobile", "unknown"}
+            ]
+            refreshed_public.sort(key=public_proxy_sort_key)
+            current_vpn_ids = [
+                str(node.get("id") or "") for node in read_nodes()
+                if str(node.get("ip_type") or "").lower() in {"residential", "mobile"}
+            ]
+            node_ids[:] = list(dict.fromkeys([
+                *current_vpn_ids,
+                *[str(node.get("id") or "") for node in refreshed_public[:PUBLIC_PROXY_AUTO_TEST_LIMIT]],
+            ]))
+            total = len(node_ids)
+            if not node_ids:
+                raise RuntimeError("更新后仍没有可检测的住宅或公共代理节点")
+            set_state(auto_residential_message=f"公共代理已去重 {refresh_result['duplicates_removed']} 个，开始实测 0/{total}")
+            results = test_combined_nodes(node_ids, progress_callback=update_progress)
             completed = len(results)
             available = sum(item.get("probe_status") == "available" for item in results)
             unavailable = completed - available
@@ -2676,10 +2935,15 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
                     reason=f"自动整理：连续 {AUTO_PRUNE_FAILURE_THRESHOLD} 次真实握手失败",
                 )
                 deleted = int(cleanup.get("deleted", 0) or 0)
+                public_cleanup = delete_unavailable_public_proxies(
+                    min_failures=AUTO_PRUNE_FAILURE_THRESHOLD,
+                    preserve_favorites=True,
+                )
+                deleted += int(public_cleanup.get("deleted", 0) or 0)
             finished_at = time.time()
             message = (
-                f"住宅节点自动整理{'提前停止' if stopped else '完成'}："
-                f"已测 {completed}/{total}，可用 {available}，不可用 {unavailable}，删除 {deleted}"
+                f"住宅/公共代理自动整理{'提前停止' if stopped else '完成'}："
+                f"去重 {refresh_result['duplicates_removed']}，已测 {completed}/{total}，可用 {available}，不可用 {unavailable}，删除 {deleted}"
             )
             cfg = load_ui_config()
             next_run = finished_at + int(cfg.get("auto_residential_interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL)) \
@@ -2692,6 +2956,7 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
                 auto_residential_available=available,
                 auto_residential_unavailable=unavailable,
                 auto_residential_deleted=deleted,
+                auto_residential_duplicates=refresh_result["duplicates_removed"],
                 auto_residential_message=message,
                 last_check_message=message,
             )
@@ -2729,7 +2994,7 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
         set_state(is_connecting=False, auto_residential_running=False)
         maintenance_lock.release()
         raise
-    return True, f"已启动 {total} 个住宅节点的自动测速、排序与失效清理"
+    return True, f"已启动住宅/OpenVPN 与公共代理池的更新、去重、测速、排序和失效清理"
 
 
 def auto_residential_scheduler_loop() -> None:
@@ -2873,13 +3138,90 @@ def recover_after_manual_connect_failure(previous_node_id: str) -> None:
     if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode") != "fixed_ip":
         auto_switch_node()
 
+def connect_public_proxy(node_id: str) -> str:
+    global active_public_proxy_id, active_openvpn_node_id, is_connecting
+    node_id = str(node_id or "").strip()
+    with lock:
+        node = next((item.copy() for item in read_public_proxies() if item.get("id") == node_id), None)
+    if not node:
+        raise ValueError(f"Public proxy node not found: {node_id}")
+
+    is_connecting = True
+    set_state(
+        is_connecting=True,
+        pending_node_id=node_id,
+        tunnel_ready=False,
+        proxy_ready=False,
+        proxy_ok=False,
+        last_check_message=f"正在验证公共代理节点 {node_id}...",
+    )
+    try:
+        result = public_proxy_pool.probe_proxy(node)
+        with lock:
+            nodes = read_public_proxies()
+            stored = next((item for item in nodes if item.get("id") == node_id), None)
+            if stored:
+                apply_probe_health(stored, result)
+                write_json(PUBLIC_PROXIES_FILE, sorted(nodes, key=public_proxy_sort_key))
+        if result.get("probe_status") != "available":
+            raise RuntimeError(f"公共代理预检失败: {result.get('probe_message') or 'unknown error'}")
+
+        stop_active_openvpn()
+        active_openvpn_node_id = ""
+        proxy_server.set_active_upstream(node)
+        active_public_proxy_id = node_id
+        with lock:
+            nodes = read_public_proxies()
+            for item in nodes:
+                item["active"] = item.get("id") == node_id
+            write_json(PUBLIC_PROXIES_FILE, sorted(nodes, key=public_proxy_sort_key))
+            vpn_nodes = read_nodes()
+            for item in vpn_nodes:
+                item["active"] = False
+            write_json(NODES_FILE, sort_all_nodes(vpn_nodes))
+        exit_ip = str(result.get("exit_ip") or node.get("ip") or "-")
+        latency = parse_int(result.get("latency_ms"))
+        message = f"已切换公共 {str(node.get('protocol') or '').upper()} 代理: {node.get('remote_host')}:{node.get('remote_port')}"
+        set_state(
+            is_connecting=False,
+            pending_node_id="",
+            active_openvpn_node_id="",
+            active_public_proxy_id=node_id,
+            active_node_latency=f"{latency} ms" if latency else "已连接",
+            tunnel_ready=True,
+            proxy_ready=True,
+            proxy_ok=True,
+            proxy_ip=exit_ip,
+            proxy_latency_ms=latency,
+            proxy_error="",
+            last_check_message=message,
+        )
+        log_to_json("INFO", "Proxy", message)
+        return message
+    except Exception:
+        proxy_server.set_active_upstream(None)
+        active_public_proxy_id = ""
+        set_state(is_connecting=False, pending_node_id="", tunnel_ready=False, proxy_ready=False, proxy_ok=False)
+        raise
+    finally:
+        is_connecting = False
+
+
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id
+    global active_public_proxy_id
     global last_active_ping_time, last_active_latency
     global consecutive_proxy_failures, last_proxy_failure_node_id
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Node id is required")
+    if any(item.get("id") == node_id for item in read_public_proxies()):
+        token, cancel_event = begin_connection_attempt()
+        try:
+            return connect_public_proxy(node_id)
+        finally:
+            finish_connection_attempt(token, cancel_event)
+            set_state(pending_node_id="")
 
     token, cancel_event = begin_connection_attempt()
     stopped_existing = False
@@ -2900,6 +3242,9 @@ def connect_node(node_id: str) -> str:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
+
+        proxy_server.set_active_upstream(None)
+        active_public_proxy_id = ""
 
         with lock:
             if active_openvpn_running():
@@ -3102,7 +3447,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
     try:
         # A forced refresh must not tear down a healthy tunnel. It only forces
         # the node-pool maintenance path below.
-        if not active_openvpn_running():
+        if not active_connection_running():
             ui_cfg = load_ui_config()
             routing_mode = ui_cfg.get("routing_mode", "auto")
             connection_enabled = ui_cfg.get("connection_enabled", True)
@@ -3200,7 +3545,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
         should_fast_connect = (
             ui_cfg.get("connection_enabled", True)
             and ui_cfg.get("routing_mode", "auto") != "fixed_ip"
-            and not active_openvpn_running()
+            and not active_connection_running()
         )
         if should_fast_connect:
             with lock:
@@ -3308,7 +3653,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 print(warn_msg, flush=True)
                 log_to_json("WARNING", "Main", warn_msg)
             
-            if not active_openvpn_running():
+            if not active_connection_running():
                 ui_cfg = load_ui_config()
                 connection_enabled = ui_cfg.get("connection_enabled", True)
                 if connection_enabled:
@@ -3356,12 +3701,49 @@ def collector_loop() -> None:
             log_to_json("ERROR", "Main", err_msg)
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
             
-        if not active_openvpn_running() and not success:
+        if not active_connection_running() and not success:
             sleep_time = 30
         else:
             sleep_time = CHECK_INTERVAL_SECONDS
             
         time.sleep(sleep_time)
+
+
+def public_proxy_collector_loop() -> None:
+    time.sleep(5)
+    while True:
+        try:
+            acquired = maintenance_lock.acquire(blocking=False)
+            if acquired:
+                try:
+                    refresh_public_proxy_pool()
+                finally:
+                    maintenance_lock.release()
+        except Exception as exc:
+            message = f"公共代理池自动更新失败: {exc}"
+            set_state(public_proxy_last_message=message)
+            log_to_json("ERROR", "Proxy", message)
+        time.sleep(PUBLIC_PROXY_REFRESH_SECONDS)
+
+
+def refresh_all_node_pools() -> None:
+    """Refresh OpenVPN candidates, then refresh and deduplicate public proxy feeds."""
+    try:
+        maintain_valid_nodes(False)
+    except Exception as exc:
+        log_to_json("ERROR", "VPN", f"手动更新 OpenVPN 节点失败: {exc}")
+    acquired = maintenance_lock.acquire(blocking=False)
+    if not acquired:
+        set_state(last_check_message="OpenVPN 节点已更新；公共代理池正由其他任务整理")
+        return
+    try:
+        result = refresh_public_proxy_pool()
+        set_state(last_check_message=result["message"])
+    except Exception as exc:
+        log_to_json("ERROR", "Proxy", f"手动更新公共代理池失败: {exc}")
+        set_state(last_check_message=f"OpenVPN 节点已更新；公共代理池更新失败: {exc}")
+    finally:
+        maintenance_lock.release()
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -4937,6 +5319,11 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
     </div>
+    <select id="transport_filter" aria-label="节点来源类型">
+      <option value="all">全部来源</option>
+      <option value="openvpn">OpenVPN 节点</option>
+      <option value="public_proxy">公共 HTTP/SOCKS</option>
+    </select>
     <select id="ip_type_filter">
       <option value="">所有IP类型</option>
       <option value="residential">住宅IP</option>
@@ -4975,7 +5362,7 @@ INDEX_HTML = r"""<!doctype html>
     <div id="auto_residential_panel" style="flex-basis:100%; width:100%; padding:14px; border:1px solid rgba(34,211,238,.25); background:rgba(34,211,238,.055); border-radius:10px; box-sizing:border-box; display:flex; flex-wrap:wrap; align-items:center; gap:10px;">
       <label style="display:flex; align-items:center; gap:8px; font-size:13px; font-weight:700; color:var(--text-primary);">
         <input id="auto_residential_enabled" type="checkbox" style="width:17px; height:17px; accent-color:#10b981;">
-        自动整理住宅节点
+        自动整理住宅/公共代理
       </label>
       <select id="auto_residential_interval" aria-label="自动整理周期" style="height:38px;">
         <option value="3600">每 1 小时</option>
@@ -5680,6 +6067,7 @@ function clearDiscoveryCountries(event) {
 function getFilteredNodes() {
   const selectedIpType = $("ip_type_filter").value;
   const selectedStatus = $("status_filter").value;
+  const selectedTransport = $("transport_filter") ? $("transport_filter").value : "all";
   const filtered = nodes.filter(n => {
     if (!n) return false;
     const countryCode = String(n.country_short || "").trim().toUpperCase();
@@ -5694,6 +6082,8 @@ function getFilteredNodes() {
         return false;
       }
     }
+    const nodeTransport = n.node_kind === "public_proxy" ? "public_proxy" : "openvpn";
+    if (selectedTransport !== "all" && selectedTransport !== nodeTransport) return false;
     if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) {
       return false;
     }
@@ -5941,6 +6331,8 @@ function render(){
         ? `IP 推测位置：${displayLocation}；节点申报国家：${translateCountry(n.country)}`
         : `节点申报国家：${translateCountry(n.country)}`;
       const ipTypeTitle = `${translateIpType(n.ip_type)} · 置信度：${translateConfidence(n.ip_type_confidence)} · 来源：${(n.ip_type_sources || []).join(" + ") || "未知"}`;
+      const transportLabel = n.node_kind === "public_proxy" ? String(n.protocol || n.proto || "proxy").toUpperCase() : "OVPN";
+      const sourceTitle = n.node_kind === "public_proxy" ? `公共代理来源：${(n.sources || [n.source]).filter(Boolean).join(" + ")}` : `OpenVPN 来源：${n.source || "vpngate"}`;
       
       const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
@@ -5963,7 +6355,7 @@ function render(){
 
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(sourceTitle)}"><span style="font-size:10px;color:${n.node_kind === "public_proxy" ? "#22d3ee" : "#a5b4fc"};border:1px solid currentColor;border-radius:4px;padding:1px 4px;margin-right:6px;">${esc(transportLabel)}</span>${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
         <td style="white-space: nowrap;">${latencyText}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
@@ -6158,12 +6550,12 @@ function updateAutoResidentialUI() {
   } else if (state.auto_residential_enabled) {
     const last = Number(state.auto_residential_last_run_at) ? `上次：${formatScheduleTime(state.auto_residential_last_run_at)}；` : "尚未执行；";
     const summary = Number(state.auto_residential_last_run_at)
-      ? `上轮已测 ${Number(state.auto_residential_tested) || 0}，可用 ${Number(state.auto_residential_available) || 0}，失效 ${Number(state.auto_residential_unavailable) || 0}，删除 ${Number(state.auto_residential_deleted) || 0}；`
+      ? `上轮跨源去重 ${Number(state.auto_residential_duplicates) || 0}，已测 ${Number(state.auto_residential_tested) || 0}，可用 ${Number(state.auto_residential_available) || 0}，失效 ${Number(state.auto_residential_unavailable) || 0}，删除 ${Number(state.auto_residential_deleted) || 0}；`
       : "";
     status.textContent = `自动整理已启用。${last}${summary}下次：${formatScheduleTime(state.auto_residential_next_run_at)}`;
     status.style.color = "#22d3ee";
   } else {
-    status.textContent = "自动整理未启用；收藏节点和当前活动节点始终不会被自动删除。";
+    status.textContent = "自动整理未启用；启用后会定时更新多来源公共池、跨源去重、真实出口测速、低延迟排序并删除连续失效节点。收藏节点和当前活动节点不会被自动删除。";
     status.style.color = "var(--text-secondary)";
   }
 }
@@ -6444,6 +6836,7 @@ document.addEventListener("keydown", event => {
 });
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
+$("transport_filter").onchange=()=>{ currentPage = 1; render(); };
 $("sort_filter").onchange=()=>{ currentPage = 1; render(); };
 $("auto_residential_enabled").onchange=()=>{ autoResidentialDirty = true; updateAutoResidentialUI(); };
 $("auto_residential_interval").onchange=()=>{ autoResidentialDirty = true; updateAutoResidentialUI(); };
@@ -7382,9 +7775,9 @@ def background_proxy_checker() -> None:
                 time.sleep(5)
                 continue
 
-            checked_node_id = active_openvpn_node_id
+            checked_node_id = active_public_proxy_id or active_openvpn_node_id
             res = check_proxy_health()
-            if checked_node_id != active_openvpn_node_id:
+            if checked_node_id != (active_public_proxy_id or active_openvpn_node_id):
                 continue
             if res["ok"]:
                 reset_proxy_failure_counter(checked_node_id)
@@ -7398,7 +7791,7 @@ def background_proxy_checker() -> None:
             else:
                 error_msg = res.get("error", "未知错误")
                 failure_count = record_proxy_failure(checked_node_id) if checked_node_id else 0
-                process_exited = bool(checked_node_id) and not active_openvpn_running()
+                process_exited = bool(checked_node_id) and checked_node_id == active_openvpn_node_id and not active_openvpn_running()
                 should_recover = process_exited or failure_count >= PROXY_FAILURE_THRESHOLD
                 if checked_node_id:
                     print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理当前不可用！原因: {error_msg}", flush=True)
@@ -7425,12 +7818,14 @@ def background_proxy_checker() -> None:
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
                         with lock:
-                            nodes = read_nodes()
+                            target_file = PUBLIC_PROXIES_FILE if checked_node_id == active_public_proxy_id else NODES_FILE
+                            nodes = read_public_proxies() if target_file == PUBLIC_PROXIES_FILE else read_nodes()
                             active_node = next((n for n in nodes if n.get("id") == checked_node_id), None)
                             if active_node:
                                 mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
                                 active_node["probe_status"] = "unavailable"
-                                write_json(NODES_FILE, nodes)
+                                write_json(target_file, nodes)
+                        clear_active_connection_state(f"活动代理连续失败: {error_msg}")
                         auto_switch_node()
                     else:
                         print(f"[代理守护线程] 固定 IP 模式下代理不可用，正在尝试重启连接同一节点: {checked_node_id}", flush=True)
@@ -7569,14 +7964,15 @@ class Handler(BaseHTTPRequestHandler):
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
-            global last_active_ping_time, last_active_latency, active_openvpn_node_id
-            nodes = read_nodes()
+            global last_active_ping_time, last_active_latency, active_openvpn_node_id, active_public_proxy_id
+            nodes = read_all_nodes()
             connection_state = get_state()
             connection_ready = connection_ready_for_ui(connection_state)
-            active_node = next((n for n in nodes if connection_ready and n.get("id") == active_openvpn_node_id), None)
+            active_id = active_public_proxy_id or active_openvpn_node_id
+            active_node = next((n for n in nodes if connection_ready and n.get("id") == active_id), None)
             for n in nodes:
-                n["active"] = bool(connection_ready and n.get("id") == active_openvpn_node_id)
-            if active_node:
+                n["active"] = bool(connection_ready and n.get("id") == active_id)
+            if active_node and active_node.get("node_kind") != "public_proxy":
                 ip = active_node.get("ip") or active_node.get("remote_host")
                 if ip:
                     now = time.time()
@@ -7666,12 +8062,13 @@ class Handler(BaseHTTPRequestHandler):
                 "details": f"监听地址: {LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
                 "error": proxy_err
             }
-            ovpn_ok = active_openvpn_running()
+            public_ok = bool(active_public_proxy_id and proxy_server.get_active_upstream())
+            ovpn_ok = active_openvpn_running() or public_ok
             ovpn_err = ""
             ovpn_details = "未连接"
             if ovpn_ok:
-                ovpn_details = f"已连接节点: {active_openvpn_node_id}"
-                if sys.platform.startswith("linux"):
+                ovpn_details = f"已连接公共代理: {active_public_proxy_id}" if public_ok else f"已连接 OpenVPN 节点: {active_openvpn_node_id}"
+                if not public_ok and sys.platform.startswith("linux"):
                     if not Path("/sys/class/net/tun0").exists():
                         ovpn_err = "[警告] 虚拟网卡 (tun0) 未启用，可能存在策略路由配置问题。"
             else:
@@ -7679,7 +8076,7 @@ class Handler(BaseHTTPRequestHandler):
                     ovpn_err = "连接已中断或 OpenVPN 核心程序异常退出。"
                     ovpn_details = f"尝试连接节点 {active_openvpn_node_id} 失败"
             openvpn_status = {
-                "name": "OpenVPN 核心连接",
+                "name": "出站传输连接",
                 "status": "running" if ovpn_ok else "stopped",
                 "details": ovpn_details,
                 "error": ovpn_err
@@ -8039,10 +8436,10 @@ class Handler(BaseHTTPRequestHandler):
                         "discovery_countries": discovery_countries,
                     })
                 else:
-                    threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
+                    threading.Thread(target=refresh_all_node_pools, daemon=True).start()
                     self.send_json({
                         "ok": True,
-                        "message": "已在后台启动节点更新流程",
+                        "message": "已在后台启动 OpenVPN 与公共代理池更新、跨源去重流程",
                         "running": True,
                         "discovery_countries": discovery_countries,
                     })
@@ -8102,10 +8499,17 @@ class Handler(BaseHTTPRequestHandler):
                 if not acquired:
                     self.send_json({"ok": False, "error": "当前正在连接、更新或测速，请稍后再删除"}, HTTPStatus.CONFLICT)
                     return
-                result = delete_unavailable_nodes(
-                    [str(item or "").strip() for item in node_ids] if isinstance(node_ids, list) else None,
+                requested_ids = [str(item or "").strip() for item in node_ids] if isinstance(node_ids, list) else None
+                vpn_result = delete_unavailable_nodes(
+                    requested_ids,
                     reason="面板批量删除失效节点",
                 )
+                public_result = delete_unavailable_public_proxies(requested_ids)
+                result = {
+                    "deleted": int(vpn_result.get("deleted", 0)) + int(public_result.get("deleted", 0)),
+                    "remaining": int(vpn_result.get("remaining", 0)) + int(public_result.get("remaining", 0)),
+                    "deleted_ids": [*vpn_result.get("deleted_ids", []), *public_result.get("deleted_ids", [])],
+                }
                 self.send_json({"ok": True, **result})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -8137,7 +8541,7 @@ class Handler(BaseHTTPRequestHandler):
                     is_connecting = True
                 try:
                     set_state(is_connecting=True, last_check_message="正在手动测试节点可用性...")
-                    tested_nodes = test_multiple_nodes(node_ids)
+                    tested_nodes = test_combined_nodes(node_ids)
                     self.send_json({"ok": True, "nodes": tested_nodes})
                 finally:
                     with lock:
@@ -8168,7 +8572,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect":
-            previous_node_id = active_openvpn_node_id if active_openvpn_running() else ""
+            previous_node_id = (active_public_proxy_id or active_openvpn_node_id) if active_connection_running() else ""
             try:
                 payload = self.read_json_body()
                 self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""))})
@@ -8225,8 +8629,8 @@ class Handler(BaseHTTPRequestHandler):
                 if result["ok"]:
                     set_state(
                         proxy_ok=True,
-                        tunnel_ready=active_openvpn_running(),
-                        proxy_ready=active_openvpn_running(),
+                        tunnel_ready=active_connection_running(),
+                        proxy_ready=active_connection_running(),
                         proxy_ip=result["ip"],
                         proxy_latency_ms=result["latency_ms"],
                         proxy_error=""
@@ -8292,6 +8696,7 @@ def main() -> None:
             "check_interval_seconds": CHECK_INTERVAL_SECONDS,
             "local_proxy": f"http://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
             "active_openvpn_node_id": "",
+            "active_public_proxy_id": "",
             "last_fetch_status": "starting",
             "last_fetch_source": "",
             "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
@@ -8309,7 +8714,14 @@ def main() -> None:
             "auto_residential_available": previous_runtime_state.get("auto_residential_available", 0) if isinstance(previous_runtime_state, dict) else 0,
             "auto_residential_unavailable": previous_runtime_state.get("auto_residential_unavailable", 0) if isinstance(previous_runtime_state, dict) else 0,
             "auto_residential_deleted": previous_runtime_state.get("auto_residential_deleted", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "auto_residential_duplicates": previous_runtime_state.get("auto_residential_duplicates", 0) if isinstance(previous_runtime_state, dict) else 0,
             "auto_residential_message": previous_runtime_state.get("auto_residential_message", "") if isinstance(previous_runtime_state, dict) else "",
+            "public_proxy_count": len(read_public_proxies()),
+            "public_proxy_duplicates_removed": previous_runtime_state.get("public_proxy_duplicates_removed", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "public_proxy_source_counts": previous_runtime_state.get("public_proxy_source_counts", {}) if isinstance(previous_runtime_state, dict) else {},
+            "public_proxy_source_errors": previous_runtime_state.get("public_proxy_source_errors", []) if isinstance(previous_runtime_state, dict) else [],
+            "public_proxy_last_fetch_at": previous_runtime_state.get("public_proxy_last_fetch_at", 0) if isinstance(previous_runtime_state, dict) else 0,
+            "public_proxy_last_message": previous_runtime_state.get("public_proxy_last_message", "") if isinstance(previous_runtime_state, dict) else "",
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
@@ -8362,6 +8774,7 @@ def main() -> None:
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     threading.Thread(target=auto_residential_scheduler_loop, daemon=True).start()
+    threading.Thread(target=public_proxy_collector_loop, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
