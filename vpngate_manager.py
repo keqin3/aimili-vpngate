@@ -216,6 +216,9 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+HOSTING_HISTORY_FILE = DATA_DIR / "hosting_rotation_history.json"
+HOSTING_CANDIDATE_LIMIT = 200
+HOSTING_KEEP_LIMIT = 100
 API_CACHE_FILE = DATA_DIR / "api_snapshot.csv"
 API_CACHE_META_FILE = DATA_DIR / "api_snapshot.meta.json"
 BUNDLED_SNAPSHOT_FILE = ROOT_DIR / "mirror" / "vpngate.csv"
@@ -2210,6 +2213,95 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     return available_nodes + untested_nodes + unavailable_nodes
 
+def load_hosting_history() -> set[str]:
+    with lock:
+        try:
+            if HOSTING_HISTORY_FILE.exists():
+                data = json.loads(HOSTING_HISTORY_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return set(str(x) for x in data if x)
+        except Exception:
+            pass
+        return set()
+
+def save_hosting_history(history_ids: set[str]) -> None:
+    with lock:
+        try:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            hist_list = list(history_ids)[-2000:]
+            write_json(HOSTING_HISTORY_FILE, hist_list)
+        except Exception:
+            pass
+
+def prune_and_rotate_hosting_nodes(nodes: list[dict[str, Any]], active_id: str = "") -> list[dict[str, Any]]:
+    """
+    当 IP 路由限制为住宅时 (routing_ip_type == residential):
+    1. 限制机房候选最多 200 个 (采用轮换历史，优先选取未见过的新节点实现轮换不重复)
+    2. 从这 200 个机房候选中按“低延迟优先、高速度优先、来源评分高优先”精选保留最优的 100 个
+    3. 完全保留所有住宅 IP、移动 IP 以及当前活动/收藏节点
+    """
+    if not nodes:
+        return []
+    
+    ui_cfg = load_ui_config()
+    if ui_cfg.get("routing_ip_type") != "residential":
+        return nodes
+
+    fav_ids = set(ui_cfg.get("favorite_node_ids", []))
+    history_ids = load_hosting_history()
+
+    residential_or_protected = []
+    unclassified_nodes = []
+    hosting_nodes = []
+
+    for n in nodes:
+        nid = str(n.get("id") or "")
+        iptype = str(n.get("ip_type") or "").strip().lower()
+        
+        if nid and (nid == active_id or nid in fav_ids):
+            residential_or_protected.append(n)
+        elif iptype in ("residential", "mobile"):
+            residential_or_protected.append(n)
+        elif not iptype or iptype == "unknown":
+            unclassified_nodes.append(n)
+        elif iptype == "hosting":
+            hosting_nodes.append(n)
+        else:
+            unclassified_nodes.append(n)
+
+    if len(hosting_nodes) <= HOSTING_KEEP_LIMIT:
+        return residential_or_protected + unclassified_nodes + hosting_nodes
+
+    def node_quality_score(n: dict[str, Any]) -> tuple:
+        latency = parse_int(n.get("latency_ms")) or parse_int(n.get("ping")) or 999999
+        if latency <= 0:
+            latency = 999999
+        speed = parse_int(n.get("speed")) or 0
+        score = parse_int(n.get("score")) or 0
+        return (latency, -speed, -score)
+
+    fresh_hosting = [n for n in hosting_nodes if str(n.get("id") or "") not in history_ids]
+    stale_hosting = [n for n in hosting_nodes if str(n.get("id") or "") in history_ids]
+
+    fresh_hosting.sort(key=node_quality_score)
+    stale_hosting.sort(key=node_quality_score)
+
+    candidate_hosting = (fresh_hosting + stale_hosting)[:HOSTING_CANDIDATE_LIMIT]
+    candidate_hosting.sort(key=node_quality_score)
+    selected_hosting = candidate_hosting[:HOSTING_KEEP_LIMIT]
+
+    for n in selected_hosting:
+        nid = str(n.get("id") or "")
+        if nid:
+            history_ids.add(nid)
+    if len(fresh_hosting) <= HOSTING_KEEP_LIMIT:
+        history_ids = {str(n.get("id") or "") for n in selected_hosting if n.get("id")}
+    save_hosting_history(history_ids)
+
+    print(f"[机房节点轮换与修剪] 总机房节点 {len(hosting_nodes)} -> 候选限制 {len(candidate_hosting)} -> 筛选保留最优 {len(selected_hosting)} 个 (已保留全部 {len(residential_or_protected)} 个住宅IP)", flush=True)
+
+    return residential_or_protected + unclassified_nodes + selected_hosting
+
 def enrich_stored_nodes() -> int:
     """Enrich every listed IP, then merge only metadata into the latest state."""
     with lock:
@@ -2239,7 +2331,8 @@ def enrich_stored_nodes() -> int:
                     current[field] = new_value
                     changed += 1
         if changed:
-            write_json(NODES_FILE, sort_all_nodes(current_nodes))
+            pruned_nodes = prune_and_rotate_hosting_nodes(current_nodes, active_openvpn_node_id)
+            write_json(NODES_FILE, sort_all_nodes(pruned_nodes))
     return changed
 
 def ip_enrichment_loop() -> None:
@@ -3535,6 +3628,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     except Exception:
                         pass
                         
+            merged = prune_and_rotate_hosting_nodes(merged, active_openvpn_node_id)
             write_json(NODES_FILE, merged)
             ip_enrichment_wakeup.set()
 
@@ -5609,7 +5703,7 @@ INDEX_HTML = r"""<!doctype html>
               </button>
               <button type="button" class="option-card" data-value="residential" aria-pressed="false" onclick="setRoutingIpType('residential')">
                 <div class="option-card-title">住宅IP</div>
-                <div class="option-card-desc">静态家宽</div>
+                <div class="option-card-desc">保留全部住宅+轮换精选100个机房</div>
               </button>
               <button type="button" class="option-card" data-value="hosting" aria-pressed="false" onclick="setRoutingIpType('hosting')">
                 <div class="option-card-title">机房IP</div>
@@ -8416,6 +8510,12 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                if routing_ip_type == "residential":
+                    with lock:
+                        cur_nodes = read_nodes()
+                        pruned_cur = prune_and_rotate_hosting_nodes(cur_nodes, active_openvpn_node_id)
+                        if len(pruned_cur) != len(cur_nodes):
+                            write_json(NODES_FILE, sort_all_nodes(pruned_cur))
                 if routing_mode == "favorites":
                     ui_cfg["fav_fail_fallback"] = False
                 if routing_mode == "fixed_ip":
