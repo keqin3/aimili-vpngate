@@ -4500,6 +4500,67 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
     }
 
+        .toolbar-search {
+      position: relative;
+      display: flex;
+      align-items: center;
+      min-width: 220px;
+      flex: 1 1 220px;
+      max-width: 340px;
+    }
+    .toolbar-search input {
+      width: 100%;
+      height: 42px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 0 34px 0 36px;
+      color: var(--text-primary);
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+      transition: all 0.2s ease;
+      box-sizing: border-box;
+    }
+    .toolbar-search input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+      background: rgba(255, 255, 255, 0.06);
+    }
+    .toolbar-search input::placeholder {
+      color: var(--text-secondary);
+      opacity: 0.7;
+    }
+    .toolbar-search .search-icon {
+      position: absolute;
+      left: 11px;
+      width: 15px;
+      height: 15px;
+      color: var(--text-secondary);
+      pointer-events: none;
+    }
+    .toolbar-search .clear-btn {
+      position: absolute;
+      right: 8px;
+      width: 22px;
+      height: 22px;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      padding: 0;
+      font-size: 12px;
+      line-height: 1;
+    }
+    .toolbar-search .clear-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--text-primary);
+    }
+
     .toolbar select {
       width: 180px;
       height: 42px;
@@ -5293,6 +5354,13 @@ INDEX_HTML = r"""<!doctype html>
 
 
   <section class="toolbar">
+    <div class="toolbar-search">
+      <svg class="search-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+      </svg>
+      <input id="node_search_input" type="text" placeholder="搜索 IP / 域名 / 端口 / 位置..." autocomplete="off" spellcheck="false" />
+      <button id="node_search_clear" class="clear-btn" type="button" title="清空搜索">✕</button>
+    </div>
     <select id="status_filter">
       <option value="all">全部节点</option>
       <option value="available">可用节点</option>
@@ -6068,8 +6136,13 @@ function getFilteredNodes() {
   const selectedIpType = $("ip_type_filter").value;
   const selectedStatus = $("status_filter").value;
   const selectedTransport = $("transport_filter") ? $("transport_filter").value : "all";
+  const searchKw = $("node_search_input") ? $("node_search_input").value.trim().toLowerCase() : "";
   const filtered = nodes.filter(n => {
     if (!n) return false;
+    if (searchKw) {
+      const matchTarget = `${n.ip || ""} ${n.remote_host || ""} ${n.remote_port || ""} ${n.id || ""} ${n.location || ""} ${n.country || ""} ${n.country_short || ""} ${n.owner || ""} ${n.as_name || ""}`.toLowerCase();
+      if (!matchTarget.includes(searchKw)) return false;
+    }
     const countryCode = String(n.country_short || "").trim().toUpperCase();
     if (selectedDiscoveryCountries.size && !selectedDiscoveryCountries.has(countryCode)) {
       return false;
@@ -6834,6 +6907,43 @@ document.addEventListener("keydown", event => {
     if (wasOpen) $("country_filter_button").focus();
   }
 });
+const searchInput = $("node_search_input");
+const searchClear = $("node_search_clear");
+if (searchInput) {
+  let searchTimer = null;
+  searchInput.oninput = () => {
+    if (searchClear) searchClear.style.display = searchInput.value ? "flex" : "none";
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      currentPage = 1;
+      render();
+    }, 150);
+  };
+  searchInput.onkeydown = (e) => {
+    if (e.key === "Enter") {
+      clearTimeout(searchTimer);
+      currentPage = 1;
+      render();
+    } else if (e.key === "Escape") {
+      searchInput.value = "";
+      if (searchClear) searchClear.style.display = "none";
+      currentPage = 1;
+      render();
+    }
+  };
+}
+if (searchClear) {
+  searchClear.onclick = () => {
+    if (searchInput) {
+      searchInput.value = "";
+      searchInput.focus();
+    }
+    searchClear.style.display = "none";
+    currentPage = 1;
+    render();
+  };
+}
+
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
 $("transport_filter").onchange=()=>{ currentPage = 1; render(); };
