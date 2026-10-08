@@ -558,6 +558,8 @@ def update_service():
                     return
             
             print(f"\n正在切换并重置到正式版 origin/{branch} ...", flush=True)
+            subprocess.run(["git", "reset", "--hard", "HEAD"], check=False)
+            subprocess.run(["git", "clean", "-fd"], check=False)
             subprocess.run(["git", "checkout", "-B", branch, f"origin/{branch}"], check=True)
             subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], check=True)
             
