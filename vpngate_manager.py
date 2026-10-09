@@ -63,6 +63,7 @@ import proxy_server
 import snapshot_utils
 import node_sources
 import node_pool
+import connection_policy
 import copy
 import gzip
 import public_proxy_pool
@@ -237,6 +238,7 @@ WEB_LOG_MAX_ENTRIES = 500
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
 connection_attempt_lock = threading.Lock()
+auto_switch_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
@@ -278,6 +280,7 @@ IP_ENRICHMENT_FIELDS = (
     "ip_type_confidence",
     "ip_type_sources",
     "geo_country_short",
+    "geo_region", "geo_city", "geo_lat", "geo_lon",
 )
 
 class ConnectionCancelled(RuntimeError):
@@ -410,6 +413,9 @@ def load_ui_config() -> dict[str, Any]:
             "port": UI_PORT,
             "proxy_port": LOCAL_PROXY_PORT,
             "routing_mode": "auto",
+            "switch_policy": "sticky",
+            "rotation_interval_seconds": 3600,
+            "failover_enabled": True,
             "force_country": "",
             "routing_ip_type": "all",
             "connection_enabled": True,
@@ -430,7 +436,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "auto_residential_enabled", "auto_residential_interval_seconds"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries", "auto_residential_enabled", "auto_residential_interval_seconds", "switch_policy", "rotation_interval_seconds", "failover_enabled"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -480,6 +486,17 @@ def load_ui_config() -> dict[str, Any]:
             config["auto_residential_enabled"] = normalized_auto_enabled
             updated = True
             
+        if config.get("switch_policy") not in {"sticky", "interval"}:
+            config["switch_policy"] = "sticky"
+            updated = True
+        interval = bounded_int(config.get("rotation_interval_seconds"), 3600, 300, 604800)
+        if interval != config.get("rotation_interval_seconds"):
+            config["rotation_interval_seconds"] = interval
+            updated = True
+        if not isinstance(config.get("failover_enabled"), bool):
+            config["failover_enabled"] = True
+            updated = True
+
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -657,6 +674,13 @@ def get_state() -> dict[str, Any]:
     state["password_set"] = bool(ui_cfg.get("password"))
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
+    state["switch_policy"] = ui_cfg["switch_policy"]
+    state["failover_enabled"] = ui_cfg["failover_enabled"]
+    state["rotation_interval_seconds"] = ui_cfg["rotation_interval_seconds"]
+    started = max(float(state.get("connection_started_at") or 0), float(state.get("rotation_base_at") or 0))
+    state["next_rotation_at"] = (started + ui_cfg["rotation_interval_seconds"]
+        if float(state.get("connection_started_at") or 0) > 0 and ui_cfg["switch_policy"] == "interval"
+        and ui_cfg.get("routing_mode") != "fixed_ip" and ui_cfg.get("connection_enabled", True) else 0)
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
@@ -2457,9 +2481,9 @@ def probe_priority_key(node: dict[str, Any]) -> tuple[int, int, int, int, int]:
     )
 
 def current_fixed_node_id(ui_cfg: dict[str, Any]) -> str:
-    if active_openvpn_node_id:
-        return active_openvpn_node_id
-    nodes = read_nodes()
+    if active_public_proxy_id or active_openvpn_node_id:
+        return active_public_proxy_id or active_openvpn_node_id
+    nodes = read_all_nodes()
     active_node = next((n for n in nodes if n.get("active") and n.get("id")), None)
     if active_node:
         return str(active_node.get("id") or "")
@@ -2486,11 +2510,11 @@ def validate_node_allowed_by_routing(node: dict[str, Any], ui_cfg: dict[str, Any
         raise RuntimeError("当前已锁定机房 IP 出站，不能连接非机房节点")
 
 def enforce_active_node_allowed_by_routing(ui_cfg: dict[str, Any], reason: str = "路由规则已更新") -> str | None:
-    active_id = active_openvpn_node_id
+    active_id = active_public_proxy_id or active_openvpn_node_id
     if not active_id:
         return None
 
-    nodes = read_nodes()
+    nodes = read_all_nodes()
     active_node = next((item for item in nodes if item.get("id") == active_id), None)
     if not active_node:
         clear_active_connection_state(f"{reason}，当前活动节点已不在节点列表中，已断开连接")
@@ -2503,34 +2527,20 @@ def enforce_active_node_allowed_by_routing(ui_cfg: dict[str, Any], reason: str =
         msg = f"{reason}，当前活动节点 {active_id} 不符合新规则，已断开连接: {exc}"
         print(f"[路由规则] {msg}", flush=True)
         log_to_json("WARNING", "Routing", msg)
-        stop_active_openvpn()
-        with lock:
-            nodes = read_nodes()
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
-        set_state(
-            active_openvpn_node_id="",
-            active_node_latency="无活动连接",
-            proxy_ok=False,
-            proxy_ip="-",
-            proxy_latency_ms=0,
-            proxy_error=msg,
-            last_check_message=msg,
-        )
+        clear_active_connection_state(msg)
 
         if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode") != "fixed_ip":
-            threading.Thread(target=auto_switch_node, daemon=True).start()
+            threading.Thread(target=auto_switch_node, kwargs={"reason": "routing"}, daemon=True).start()
         return msg
 
 def reconnect_fixed_node_if_needed(ui_cfg: dict[str, Any]) -> bool:
     global is_connecting
-    if ui_cfg.get("routing_mode") != "fixed_ip" or active_openvpn_running():
+    if ui_cfg.get("routing_mode") != "fixed_ip" or active_connection_running():
         return False
     target_id = current_fixed_node_id(ui_cfg)
     if not target_id:
         return False
-    nodes = read_nodes()
+    nodes = read_all_nodes()
     if not any(n.get("id") == target_id for n in nodes):
         return False
 
@@ -2539,7 +2549,7 @@ def reconnect_fixed_node_if_needed(ui_cfg: dict[str, Any]) -> bool:
     is_connecting = False
     try:
         connect_node(target_id)
-        return active_openvpn_running()
+        return active_connection_running()
     except Exception as e:
         print(f"[维护线程] 重新拉起固定节点 {target_id} 失败: {e}", flush=True)
         return False
@@ -3273,7 +3283,7 @@ def schedule_background_refill() -> bool:
                     if not ui_cfg.get("connection_enabled", True):
                         return
                     try:
-                        maintain_valid_nodes(force=False)
+                        run_pool_maintenance()
                     except Exception as exc:
                         log_to_json("WARNING", "Main", f"后台节点补齐失败: {exc}")
                     if active_openvpn_running():
@@ -3291,68 +3301,152 @@ def schedule_background_refill() -> bool:
         background_refill_thread.start()
         return True
 
-def auto_switch_node(attempt: int = 0) -> None:
+def record_successful_connection(node: dict[str, Any], exit_ip: str = "") -> None:
+    fields = ("id", "ip", "remote_host", "exit_ip", "country", "country_short",
+              "geo_country_short", "geo_region", "geo_city", "geo_lat", "geo_lon", "location")
+    anchor = {field: node[field] for field in fields if field in node}
+    known_ip = str(node.get("exit_ip") or node.get("ip") or "")
+    anchor["geo_exit_verified"] = bool(node.get("geo_country_short") and (not exit_ip or exit_ip == known_ip))
+    if exit_ip:
+        anchor["exit_ip"] = exit_ip
+    now = time.time()
+    set_state(last_connection_node=anchor, connection_started_at=now, rotation_base_at=now,
+              last_auto_switch_attempt_at=0, switch_message="连接稳定保持；健康时不会自行换 IP")
+
+
+def reference_geography(reference: dict[str, Any] | None, exit_ip: str = "") -> dict[str, Any] | None:
+    if not reference:
+        return None
+    anchor = dict(reference)
+    if anchor.get("geo_exit_verified") and (not exit_ip or exit_ip == anchor.get("exit_ip")):
+        return anchor
+    query_ip = str(exit_ip or anchor.get("exit_ip") or anchor.get("ip") or "")
+    if query_ip == str(anchor.get("ip") or "") and anchor.get("geo_country_short"):
+        anchor["geo_exit_verified"] = True
+    elif time.time() - float(anchor.get("geo_lookup_at") or 0) >= 900:
+        info = {"ip": query_ip}
+        vpn_utils.enrich_ip_info([info])
+        anchor["geo_lookup_at"] = time.time()
+        anchor["exit_ip"] = query_ip
+        # Source/ingress geography must not masquerade as verified exit geography.
+        for field in ("geo_country_short", "country_short", "country", "geo_city", "geo_region", "geo_lat", "geo_lon", "location"):
+            anchor.pop(field, None)
+        anchor.update({field: info[field] for field in IP_ENRICHMENT_FIELDS if field in info})
+        anchor["geo_exit_verified"] = bool(info.get("geo_country_short"))
+    with lock:
+        active_id = active_public_proxy_id or active_openvpn_node_id
+        stored = get_state().get("last_connection_node") or {}
+        if ((not active_id or active_id == anchor.get("id"))
+                and (not stored.get("id") or stored.get("id") == anchor.get("id"))):
+            set_state(last_connection_node=anchor)
+    return anchor
+
+
+def save_switch_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    cfg = load_ui_config()
+    policy = payload.get("switch_policy", cfg["switch_policy"])
+    if policy not in {"sticky", "interval"}:
+        raise ValueError("切换策略只能是 sticky 或 interval")
+    failover = payload.get("failover_enabled", cfg["failover_enabled"])
+    if not isinstance(failover, bool):
+        raise ValueError("失效自动接替必须是布尔值")
+    interval = payload.get("rotation_interval_seconds", cfg["rotation_interval_seconds"])
+    if isinstance(interval, bool) or not isinstance(interval, int) or not 300 <= interval <= 604800:
+        raise ValueError("轮换时长必须为 300 至 604800 秒（5 分钟至 7 天）")
+    with lock:
+        # Reload to preserve concurrent account/favourite changes.
+        cfg = load_ui_config()
+        timer_changed = policy != cfg["switch_policy"] or interval != cfg["rotation_interval_seconds"]
+        cfg.update(switch_policy=policy, failover_enabled=failover, rotation_interval_seconds=interval)
+        write_json(DATA_DIR / "ui_auth.json", cfg)
+        if timer_changed:
+            set_state(rotation_base_at=time.time())
+        set_state(last_auto_switch_attempt_at=0,
+                  switch_message="已保存切换策略；不会立即触发换 IP")
+    return cfg
+
+
+def auto_switch_node(attempt: int = 0, *, reason: str = "recovery",
+                     reference_node: dict[str, Any] | None = None) -> None:
     if attempt >= 3:
-        print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
         if schedule_background_refill():
             log_to_json("INFO", "Main", "连续自动切换失败，已启动唯一后台节点补齐任务")
         return
-        
-    ui_cfg = load_ui_config()
-    connection_enabled = ui_cfg.get("connection_enabled", True)
-    if not connection_enabled:
-        print("[自动切换] 连接已禁用，不进行自动切换。", flush=True)
+    cfg = load_ui_config()
+    if not cfg.get("connection_enabled", True) or cfg.get("routing_mode") == "fixed_ip":
         return
-
-    routing_mode = ui_cfg.get("routing_mode", "auto")
-    target_country = ui_cfg.get("force_country", "")
-
-    if routing_mode == "fixed_ip":
-        print("[自动切换] 当前处于固定 IP 模式，不进行自动连接或切换。", flush=True)
+    if is_connecting or maintenance_lock.locked():
         return
-
-    # Find the next best available node
-    with lock:
-        nodes = read_nodes()
-        candidates = [
-            n for n in nodes 
-            if n.get("probe_status") == "available" 
-            and not n.get("active")
-        ]
-        candidates = apply_routing_filters(candidates, ui_cfg)
-            
-        candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
-        
-    if candidates:
-        next_node = candidates[0]
-        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}"
-        print(f"[自动切换] {msg}", flush=True)
-        log_to_json("INFO", "VPN", msg)
-        try:
-            connect_node(next_node["id"])
-        except Exception as e:
-            err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
-            print(f"[自动切换] {err_msg}", flush=True)
-            log_to_json("WARNING", "VPN", err_msg)
-            auto_switch_node(attempt + 1)
-    else:
-        msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
-        if routing_mode == "fixed_region" and target_country:
-            msg = f"没有可用的【{target_country}】备选节点，已断开连接，将在后台持续尝试获取新节点..."
-        print(f"[自动切换] {msg}", flush=True)
-        log_to_json("WARNING", "VPN", msg)
-        stop_active_openvpn()
-        with lock:
-            nodes = read_nodes()
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
-        set_state(active_openvpn_node_id="", last_check_message=msg)
-        if schedule_background_refill():
-            log_to_json("INFO", "Main", "已启动唯一后台节点补齐任务")
+    # The central guard applies to pool refill, legacy collectors and recovery callers.
+    # A healthy current connection is never displaced by a newly faster node.
+    if active_connection_running() and reason not in {"failure", "interval"}:
+        return
+    observed_active_id = active_public_proxy_id or active_openvpn_node_id
+    observed_epoch = connection_epoch
+    state = get_state()
+    anchor = reference_node or state.get("last_connection_node")
+    if anchor and reason not in {"routing", "interval"} and cfg.get("failover_enabled", True):
+        anchor = reference_geography(anchor)
+    if reason == "routing":
+        anchor = None  # Explicit user country/routing changes override old country.
+    if reason == "interval":
+        if not connection_policy.interval_due(cfg, state, time.time()):
+            return
+    elif reason != "routing" and not cfg.get("failover_enabled", True):
+        set_state(switch_message="已关闭失效自动接替，等待手动选择节点")
+        return
+    if time.time() - float(state.get("last_auto_switch_attempt_at") or 0) < 60:
+        return
+    if not auto_switch_lock.acquire(blocking=False):
+        return
+    try:
+        if observed_epoch != connection_epoch or observed_active_id != (active_public_proxy_id or active_openvpn_node_id):
+            return
+        set_state(last_auto_switch_attempt_at=time.time())
+        active_id = active_public_proxy_id or active_openvpn_node_id
+        excluded = {str(active_id), str((anchor or {}).get("id") or "")}
+        nodes = apply_routing_filters(read_all_nodes(), cfg)
+        candidates = connection_policy.nearby_candidates(nodes, anchor, excluded)
+        for next_node in candidates[:3-attempt]:
+            # Stop if the operator disabled connection, changed policy, or selected
+            # another node while this automatic attempt was being prepared.
+            latest_cfg = load_ui_config()
+            if (not latest_cfg.get("connection_enabled", True)
+                    or latest_cfg.get("routing_mode") == "fixed_ip"
+                    or (reason == "interval" and latest_cfg.get("switch_policy") != "interval")
+                    or (reason != "interval" and anchor and not latest_cfg.get("failover_enabled", True))):
+                return
+            if active_id != (active_public_proxy_id or active_openvpn_node_id):
+                return
+            message = f"{'到时轮换' if reason == 'interval' else '失效接替'}：同国家优先相近地区，预检 {next_node['id']}"
+            set_state(switch_message=message)
+            if is_connecting or maintenance_lock.locked() or connection_attempt_lock.locked():
+                return
+            epoch_before = connection_epoch
+            try:
+                connect_node(str(next_node["id"]), automatic_reference=anchor)
+                set_state(switch_message=f"已完成{'到时轮换' if reason == 'interval' else '失效接替'}：{next_node['id']}")
+                return
+            except Exception as exc:
+                if connection_epoch > epoch_before + 1:
+                    return  # A newer operator request/cancellation takes precedence.
+                if is_systemic_probe_failure(str(exc)) or isinstance(exc, ConnectionCancelled):
+                    set_state(switch_message=f"本机连接环境异常或操作取消，停止自动尝试: {exc}")
+                    return
+                log_to_json("WARNING", "VPN", f"备用 {next_node['id']} 不可用，尝试下一节点: {exc}")
+                # A failed handshake can clear the dead/previous connection.
+                active_id = active_public_proxy_id or active_openvpn_node_id
+        label = connection_policy.country(anchor or {}) or "国家未知"
+        message = (f"{label} 没有可用的同国家备用；保留尚存连接、等待补齐，不跨国切换"
+                   if anchor else "没有可用备用节点，等待后台补齐")
+        set_state(switch_message=message, last_check_message=message)
+        if reason != "interval":
+            schedule_background_refill()
+    finally:
+        auto_switch_lock.release()
 
 def recover_after_manual_connect_failure(previous_node_id: str) -> None:
-    if active_openvpn_running():
+    if active_connection_running():
         return
 
     if previous_node_id:
@@ -3367,23 +3461,41 @@ def recover_after_manual_connect_failure(previous_node_id: str) -> None:
     if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode") != "fixed_ip":
         auto_switch_node()
 
-def connect_public_proxy(node_id: str) -> str:
+def verify_automatic_exit(node: dict[str, Any], exit_ip: str,
+                          reference: dict[str, Any] | None) -> None:
+    """Auto replacements need an actual/cached exit country, not source promises."""
+    if not reference:
+        return
+    target = connection_policy.country(reference)
+    known_exit = str(node.get("exit_ip") or node.get("ip") or "")
+    if exit_ip == known_exit and node.get("geo_country_short"):
+        info = node
+    else:
+        info = {"ip": exit_ip}
+        vpn_utils.enrich_ip_info([info])
+    if not target or not info.get("geo_country_short") or connection_policy.country(info) != target:
+        raise RuntimeError("备用节点真实出口国家未知或不同，拒绝自动跨国切换")
+    node.update({field: info[field] for field in IP_ENRICHMENT_FIELDS if field in info})
+    node["exit_ip"] = exit_ip
+
+
+def connect_public_proxy(node_id: str, *, cancel_event: threading.Event | None = None,
+                         token: int | None = None,
+                         automatic_reference: dict[str, Any] | None = None) -> str:
     global active_public_proxy_id, active_openvpn_node_id, is_connecting
     node_id = str(node_id or "").strip()
     with lock:
         node = next((item.copy() for item in read_public_proxies() if item.get("id") == node_id), None)
+        previous_upstream = proxy_server.get_active_upstream()
+        previous_public_id = active_public_proxy_id
+        previous_state = get_state()
     if not node:
         raise ValueError(f"Public proxy node not found: {node_id}")
-
+    validate_node_allowed_by_routing(node, load_ui_config())
+    committed = False
     is_connecting = True
-    set_state(
-        is_connecting=True,
-        pending_node_id=node_id,
-        tunnel_ready=False,
-        proxy_ready=False,
-        proxy_ok=False,
-        last_check_message=f"正在验证公共代理节点 {node_id}...",
-    )
+    set_state(is_connecting=True, pending_node_id=node_id,
+              last_check_message=f"保留当前连接，预检公共代理 {node_id}...")
     try:
         result = public_proxy_pool.probe_proxy(node)
         with lock:
@@ -3394,49 +3506,59 @@ def connect_public_proxy(node_id: str) -> str:
                 write_json(PUBLIC_PROXIES_FILE, sorted(nodes, key=public_proxy_sort_key))
         if result.get("probe_status") != "available":
             raise RuntimeError(f"公共代理预检失败: {result.get('probe_message') or 'unknown error'}")
-
-        stop_active_openvpn()
-        active_openvpn_node_id = ""
-        proxy_server.set_active_upstream(node)
-        active_public_proxy_id = node_id
+        exit_ip = str(result.get("exit_ip") or node.get("ip") or "-")
+        verify_automatic_exit(node, exit_ip, automatic_reference)
+        if token is not None and cancel_event is not None and not connection_attempt_is_current(token, cancel_event):
+            raise ConnectionCancelled("连接操作已取消")
+        validate_node_allowed_by_routing(node, load_ui_config())
         with lock:
+            if token is not None and cancel_event is not None and not connection_attempt_is_current(token, cancel_event):
+                raise ConnectionCancelled("连接操作已取消")
+            stop_active_openvpn()
+            active_openvpn_node_id = ""
+            proxy_server.set_active_upstream(node)
+            active_public_proxy_id = node_id
+            committed = True
             nodes = read_public_proxies()
             for item in nodes:
                 item["active"] = item.get("id") == node_id
+                if item["active"]:
+                    item.update({field: node[field] for field in IP_ENRICHMENT_FIELDS if field in node})
             write_json(PUBLIC_PROXIES_FILE, sorted(nodes, key=public_proxy_sort_key))
             vpn_nodes = read_nodes()
             for item in vpn_nodes:
                 item["active"] = False
             write_json(NODES_FILE, sort_all_nodes(vpn_nodes))
-        exit_ip = str(result.get("exit_ip") or node.get("ip") or "-")
+            cfg = load_ui_config()
+            cfg["connection_enabled"] = True
+            if cfg.get("routing_mode") == "fixed_ip":
+                cfg["fixed_node_id"] = node_id
+            write_json(DATA_DIR / "ui_auth.json", cfg)
+        reset_proxy_failure_counter(node_id)
         latency = parse_int(result.get("latency_ms"))
         message = f"已切换公共 {str(node.get('protocol') or '').upper()} 代理: {node.get('remote_host')}:{node.get('remote_port')}"
-        set_state(
-            is_connecting=False,
-            pending_node_id="",
-            active_openvpn_node_id="",
-            active_public_proxy_id=node_id,
-            active_node_latency=f"{latency} ms" if latency else "已连接",
-            tunnel_ready=True,
-            proxy_ready=True,
-            proxy_ok=True,
-            proxy_ip=exit_ip,
-            proxy_latency_ms=latency,
-            proxy_error="",
-            last_check_message=message,
-        )
+        set_state(is_connecting=False, pending_node_id="", active_openvpn_node_id="",
+                  active_public_proxy_id=node_id, active_node_latency=f"{latency} ms" if latency else "已连接",
+                  tunnel_ready=True, proxy_ready=True, proxy_ok=True, proxy_ip=exit_ip,
+                  proxy_latency_ms=latency, proxy_error="", last_check_message=message)
+        record_successful_connection(node, exit_ip)
         log_to_json("INFO", "Proxy", message)
         return message
     except Exception:
-        proxy_server.set_active_upstream(None)
-        active_public_proxy_id = ""
-        set_state(is_connecting=False, pending_node_id="", tunnel_ready=False, proxy_ready=False, proxy_ok=False)
+        still_current = token is None or (cancel_event is not None and connection_attempt_is_current(token, cancel_event))
+        if not committed and still_current:
+            # Preflight failure is not permission to disconnect a healthy old IP.
+            proxy_server.set_active_upstream(previous_upstream)
+            active_public_proxy_id = previous_public_id
+            set_state(is_connecting=False, pending_node_id="",
+                      **{field: previous_state.get(field) for field in
+                         ("tunnel_ready", "proxy_ready", "proxy_ok", "proxy_ip", "proxy_latency_ms")})
         raise
     finally:
         is_connecting = False
 
 
-def connect_node(node_id: str) -> str:
+def connect_node(node_id: str, *, automatic_reference: dict[str, Any] | None = None) -> str:
     global active_openvpn_process, active_openvpn_node_id
     global active_public_proxy_id
     global last_active_ping_time, last_active_latency
@@ -3447,11 +3569,13 @@ def connect_node(node_id: str) -> str:
     if any(item.get("id") == node_id for item in read_public_proxies()):
         token, cancel_event = begin_connection_attempt()
         try:
-            return connect_public_proxy(node_id)
+            return connect_public_proxy(node_id, cancel_event=cancel_event, token=token, automatic_reference=automatic_reference)
         finally:
             finish_connection_attempt(token, cancel_event)
             set_state(pending_node_id="")
 
+    previous_gateway_state = get_state()
+    previous_public_id = active_public_proxy_id
     token, cancel_event = begin_connection_attempt()
     stopped_existing = False
     previous_node_id = ""
@@ -3472,12 +3596,9 @@ def connect_node(node_id: str) -> str:
         if not node:
             raise ValueError(f"Node not found: {node_id}")
 
-        proxy_server.set_active_upstream(None)
-        active_public_proxy_id = ""
-
         with lock:
-            if active_openvpn_running():
-                previous_node_id = active_openvpn_node_id
+            if active_connection_running():
+                previous_node_id = active_public_proxy_id or active_openvpn_node_id
         
         ui_cfg = load_ui_config()
         validate_node_allowed_by_routing(node, ui_cfg)
@@ -3496,12 +3617,7 @@ def connect_node(node_id: str) -> str:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
         probed_at = float(node.get("probed_at", 0) or 0)
-        should_preflight = (
-            SWITCH_PREFLIGHT_MAX_AGE_SECONDS > 0
-            and bool(previous_node_id)
-            and previous_node_id != node_id
-            and time.time() - probed_at > SWITCH_PREFLIGHT_MAX_AGE_SECONDS
-        )
+        should_preflight = bool(previous_node_id and previous_node_id != node_id)
         if should_preflight:
             set_state(active_node_latency="切换预检", last_check_message="正在保持当前连接并预检目标节点...")
             test_index = None
@@ -3535,8 +3651,13 @@ def connect_node(node_id: str) -> str:
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
         set_state(active_node_latency="清理连接", last_check_message="目标节点可用，正在关闭旧的 VPN 连接及网卡...")
-        stop_active_openvpn()
-        stopped_existing = True
+        with lock:
+            if not connection_attempt_is_current(token, cancel_event):
+                raise ConnectionCancelled("连接操作已取消")
+            proxy_server.set_active_upstream(None)
+            active_public_proxy_id = ""
+            stop_active_openvpn()
+            stopped_existing = True
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
         ok, message, process = run_openvpn_until_ready(
@@ -3599,6 +3720,7 @@ def connect_node(node_id: str) -> str:
             route_note = "；策略路由配置失败" if not routing_ready else ""
             raise RuntimeError(f"VPN 隧道已建立但代理出口不可用{route_note}: {res.get('error', '未知错误')}")
 
+        verify_automatic_exit(node, str(res.get("ip") or ""), automatic_reference)
         latest_ui_cfg = load_ui_config()
         validate_node_allowed_by_routing(node, latest_ui_cfg)
         latest_ui_cfg["connection_enabled"] = True
@@ -3615,6 +3737,8 @@ def connect_node(node_id: str) -> str:
                 if item["active"]:
                     item["probe_status"] = "available"
                     item["probed_at"] = time.time()
+                    item.update({field: node[field] for field in IP_ENRICHMENT_FIELDS if field in node})
+                    item["exit_ip"] = str(res.get("ip") or "")
                     _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
                     item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
             write_json(NODES_FILE, sort_all_nodes(current_nodes))
@@ -3636,6 +3760,7 @@ def connect_node(node_id: str) -> str:
             )
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         cancel_background_refill()
+        record_successful_connection(node, str(res.get("ip") or ""))
         return f"Connected {node_id}"
     except ConnectionCancelled:
         if stopped_existing:
@@ -3653,7 +3778,11 @@ def connect_node(node_id: str) -> str:
                     write_json(NODES_FILE, sort_all_nodes(current_nodes))
             clear_active_connection_state(f"连接失败: {exc}")
         else:
-            set_state(is_connecting=False, pending_node_id="", last_check_message=f"连接失败: {exc}")
+            if connection_attempt_is_current(token, cancel_event):
+                active_public_proxy_id = previous_public_id
+                set_state(is_connecting=False, pending_node_id="", last_check_message=f"连接失败，保留原节点: {exc}",
+                          **{field: previous_gateway_state.get(field) for field in
+                             ("tunnel_ready", "proxy_ready", "proxy_ok", "proxy_ip", "proxy_latency_ms")})
         raise
     finally:
         finish_connection_attempt(token, cancel_event)
@@ -5756,6 +5885,18 @@ INDEX_HTML = r"""<!doctype html>
     <button id="rotate_batch" class="btn" type="button">换下一批（IP 不重复）</button>
     <span id="pool_summary" style="color:var(--text-secondary);font-size:13px;">正在读取缓存…</span>
   </div>
+  <section style="margin-bottom:16px;padding:14px;border:1px solid var(--border-color);border-radius:10px;">
+    <strong>连接切换策略</strong>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px;">
+      <label>健康时
+        <select id="switch_policy"><option value="sticky">稳定保持，仅手动换 IP</option><option value="interval">按连接时长轮换</option></select>
+      </label>
+      <label>轮换时长（分钟） <input id="rotation_minutes" type="number" min="5" max="10080" value="60" style="width:90px;"></label>
+      <label><input id="failover_enabled" type="checkbox" checked> 失效后自动同国家接替</label>
+      <button id="save_switch_policy" class="btn" type="button">保存切换策略</button>
+    </div>
+    <div id="switch_policy_status" style="margin-top:10px;color:var(--text-secondary);font-size:13px;">默认保持稳定；不会因为新节点更快就换 IP。</div>
+  </section>
   <section class="toolbar">
     <div class="toolbar-search">
       <svg class="search-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -5992,7 +6133,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="option-group" id="routing_mode_group">
               <button type="button" class="option-card active" data-value="auto" aria-pressed="true" onclick="setRoutingMode('auto')">
                 <div class="option-card-title">自动配置</div>
-                <div class="option-card-desc">智能切换，最稳定</div>
+                <div class="option-card-desc">保持当前IP，故障按策略接替</div>
               </button>
               <button type="button" class="option-card" data-value="fixed_ip" aria-pressed="false" onclick="setRoutingMode('fixed_ip')">
                 <div class="option-card-title">固定 IP</div>
@@ -6022,7 +6163,7 @@ INDEX_HTML = r"""<!doctype html>
               </button>
               <button type="button" class="option-card" data-value="residential" aria-pressed="false" onclick="setRoutingIpType('residential')">
                 <div class="option-card-title">住宅IP</div>
-                <div class="option-card-desc">保留全部住宅+轮换精选100个机房</div>
+                <div class="option-card-desc">住宅目标200，机房目标50</div>
               </button>
               <button type="button" class="option-card" data-value="hosting" aria-pressed="false" onclick="setRoutingIpType('hosting')">
                 <div class="option-card-title">机房IP</div>
@@ -6657,7 +6798,16 @@ function toggleFilteredNodeSelection(checked) {
   render();
 }
 
+let switchSettingsDirty = false;
 function render(){
+  if (!switchSettingsDirty) {
+    $("switch_policy").value = state.switch_policy || "sticky";
+    $("rotation_minutes").value = (Number(state.rotation_interval_seconds) || 3600) / 60;
+    $("failover_enabled").checked = state.failover_enabled !== false;
+  }
+  $("rotation_minutes").disabled = $("switch_policy").value !== "interval";
+  const nextSwitch = Number(state.next_rotation_at) ? `；下次轮换：${time(state.next_rotation_at)}` : "";
+  $("switch_policy_status").textContent = (state.switch_message || "健康节点稳定保持，仅在手动、到时或确认失效后切换") + nextSwitch;
   if ($("pool_summary")) $("pool_summary").textContent = state.pool_message || "缓存优先；后台按缺额补齐";
   if ($("rotate_batch")) $("rotate_batch").disabled = Boolean(state.maintenance_running || state.is_connecting);
 
@@ -7435,6 +7585,30 @@ $("sort_filter").onchange=()=>{ currentPage = 1; render(); };
 $("auto_residential_enabled").onchange=()=>{ autoResidentialDirty = true; updateAutoResidentialUI(); };
 $("auto_residential_interval").onchange=()=>{ autoResidentialDirty = true; updateAutoResidentialUI(); };
 
+for (const id of ["switch_policy", "rotation_minutes", "failover_enabled"]) {
+  $(id).onchange = () => {
+    switchSettingsDirty = true;
+    $("rotation_minutes").disabled = $("switch_policy").value !== "interval";
+  };
+}
+$("save_switch_policy").onclick = async () => {
+  const button = $("save_switch_policy");
+  button.disabled = true;
+  try {
+    const seconds = Number($("rotation_minutes").value) * 60;
+    if (!Number.isInteger(seconds) || seconds < 300 || seconds > 604800) throw new Error("时长范围为 5 分钟至 7 天");
+    const response = await fetchWithTimeout("./api/switch_settings", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({switch_policy:$("switch_policy").value,
+        rotation_interval_seconds:seconds, failover_enabled:$("failover_enabled").checked})
+    }, 20000);
+    const result = await readJsonResponse(response, "保存策略失败");
+    if (!response.ok || !result.ok) throw new Error(result.error || "保存策略失败");
+    switchSettingsDirty = false;
+    await load();
+  } catch(e) { alert(e.message || "保存策略失败"); }
+  finally { button.disabled = false; }
+};
 $("rotate_batch").onclick = async () => {
   if (!confirm("换成未使用过的新 IP？活动、收藏和固定节点会保留；没有新候选时保留当前批次。")) return;
   $("rotate_batch").disabled = true;
@@ -8257,7 +8431,8 @@ def check_proxy_health() -> dict[str, Any]:
         diag_msg = diag[1] if diag else f"端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e}"
         return {
             "ok": False,
-            "error": f"代理服务未运行 ({diag_msg})"
+            "error": f"代理服务未运行 ({diag_msg})",
+            "failure_kind": "local_gateway"
         }
     finally:
         if s is not None:
@@ -8268,7 +8443,7 @@ def check_proxy_health() -> dict[str, Any]:
 
     # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
     tun_path = Path("/sys/class/net/tun0")
-    if sys.platform.startswith("linux") and not tun_path.exists():
+    if sys.platform.startswith("linux") and not active_public_proxy_id and not tun_path.exists():
         return {
             "ok": False,
             "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
@@ -8308,6 +8483,11 @@ def check_proxy_health() -> dict[str, Any]:
                         if len(time_info) == 2:
                             total_time_str, http_code = time_info
                             if http_code == "200" and ip:
+                                try:
+                                    import ipaddress
+                                    ip = str(ipaddress.ip_address(ip))
+                                except ValueError:
+                                    continue
                                 latency_ms = int(float(total_time_str) * 1000)
                                 return {"ok": True, "ip": ip, "latency_ms": latency_ms}
             except Exception:
@@ -8315,10 +8495,10 @@ def check_proxy_health() -> dict[str, Any]:
         return None
 
     try:
-        result = _curl_check_ip("http://ip.sb")
+        result = _curl_check_ip("https://api.ip.sb/ip")
         if result:
             return result
-        result = _curl_check_ip("http://api.ipify.org")
+        result = _curl_check_ip("https://api.ipify.org")
         if result:
             return result
             
@@ -8374,77 +8554,73 @@ def record_proxy_failure(node_id: str) -> int:
         consecutive_proxy_failures += 1
         return consecutive_proxy_failures
 
+def connection_policy_tick() -> None:
+    if is_connecting or maintenance_lock.locked() or connection_attempt_lock.locked():
+        return
+    cfg = load_ui_config()
+    if not cfg.get("connection_enabled", True):
+        return
+    node_id = active_public_proxy_id or active_openvpn_node_id
+    reference = next((n.copy() for n in read_all_nodes() if n.get("id") == node_id), None)
+    stored_anchor = get_state().get("last_connection_node")
+    if stored_anchor and (not node_id or stored_anchor.get("id") == node_id):
+        reference = stored_anchor
+    result = check_proxy_health()
+    if node_id != (active_public_proxy_id or active_openvpn_node_id) or is_connecting or maintenance_lock.locked():
+        return
+    if result.get("ok"):
+        reset_proxy_failure_counter(node_id)
+        set_state(proxy_ok=True, proxy_ip=result.get("ip", "-"),
+                  proxy_latency_ms=result.get("latency_ms", 0), proxy_error="")
+        if node_id and (cfg.get("failover_enabled", True) or cfg.get("switch_policy") == "interval"):
+            reference = reference_geography(reference, str(result.get("ip") or ""))
+        if node_id and connection_policy.interval_due(cfg, get_state(), time.time()):
+            auto_switch_node(reason="interval", reference_node=reference)
+        return
+    error = str(result.get("error") or "出口检测失败")
+    if result.get("failure_kind") == "local_gateway":
+        set_state(proxy_ok=False, proxy_error=error,
+                  switch_message="本机代理服务异常；切换远端 IP 无法修复，暂不切换")
+        return
+    exited = bool(node_id and node_id == active_openvpn_node_id and not active_openvpn_running())
+    failures = record_proxy_failure(node_id) if node_id else 0
+    set_state(proxy_ok=False, proxy_error=f"{error}（连续失败 {failures}/{PROXY_FAILURE_THRESHOLD}）")
+    if node_id and not exited and failures < PROXY_FAILURE_THRESHOLD:
+        return
+    if cfg.get("routing_mode") == "fixed_ip":
+        # Explicit fixed-IP mode never falls back to a different IP.
+        if node_id:
+            try:
+                connect_node(node_id)
+            except Exception as exc:
+                set_state(switch_message=f"固定 IP 重连失败，未切换其他 IP: {exc}")
+        return
+    if not cfg.get("failover_enabled", True):
+        set_state(switch_message="已关闭失效自动接替，等待手动选择节点")
+        return
+    if node_id:
+        with lock:
+            path = PUBLIC_PROXIES_FILE if node_id == active_public_proxy_id else NODES_FILE
+            rows = read_public_proxies() if path == PUBLIC_PROXIES_FILE else read_nodes()
+            for item in rows:
+                if item.get("id") == node_id:
+                    item.update(probe_status="unavailable", probe_message=error)
+            write_json(path, rows)
+    reference = reference_geography(reference)
+    if node_id != (active_public_proxy_id or active_openvpn_node_id) or is_connecting:
+        return
+    auto_switch_node(reason="failure", reference_node=reference)
+
+
 def background_proxy_checker() -> None:
-    global last_checker_heartbeat, is_connecting
+    global last_checker_heartbeat
     time.sleep(30)
     while True:
         last_checker_heartbeat = time.time()
         try:
-            if is_connecting:
-                time.sleep(5)
-                continue
-
-            checked_node_id = active_public_proxy_id or active_openvpn_node_id
-            res = check_proxy_health()
-            if checked_node_id != (active_public_proxy_id or active_openvpn_node_id):
-                continue
-            if res["ok"]:
-                reset_proxy_failure_counter(checked_node_id)
-                set_state(
-                    proxy_ok=True,
-                    proxy_ip=res["ip"],
-                    proxy_latency_ms=res["latency_ms"],
-                    proxy_error=""
-                )
-                log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
-            else:
-                error_msg = res.get("error", "未知错误")
-                failure_count = record_proxy_failure(checked_node_id) if checked_node_id else 0
-                process_exited = bool(checked_node_id) and checked_node_id == active_openvpn_node_id and not active_openvpn_running()
-                should_recover = process_exited or failure_count >= PROXY_FAILURE_THRESHOLD
-                if checked_node_id:
-                    print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理当前不可用！原因: {error_msg}", flush=True)
-                    log_to_json(
-                        "WARNING",
-                        "Proxy",
-                        f"代理不可用 ({failure_count}/{PROXY_FAILURE_THRESHOLD}): {error_msg}",
-                    )
-                display_error = error_msg
-                if checked_node_id and not process_exited and not should_recover:
-                    display_error = f"{error_msg}（连续失败 {failure_count}/{PROXY_FAILURE_THRESHOLD}，暂不切换）"
-                set_state(
-                    proxy_ok=False,
-                    proxy_ip="-",
-                    proxy_latency_ms=0,
-                    proxy_error=display_error,
-                )
-
-                # A dead OpenVPN process is recovered immediately. Transient
-                # external probe failures must cross the configured threshold.
-                if checked_node_id and should_recover:
-                    reset_proxy_failure_counter(checked_node_id)
-                    ui_cfg = load_ui_config()
-                    routing_mode = ui_cfg.get("routing_mode", "auto")
-                    if routing_mode != "fixed_ip":
-                        with lock:
-                            target_file = PUBLIC_PROXIES_FILE if checked_node_id == active_public_proxy_id else NODES_FILE
-                            nodes = read_public_proxies() if target_file == PUBLIC_PROXIES_FILE else read_nodes()
-                            active_node = next((n for n in nodes if n.get("id") == checked_node_id), None)
-                            if active_node:
-                                mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
-                                active_node["probe_status"] = "unavailable"
-                                write_json(target_file, nodes)
-                        clear_active_connection_state(f"活动代理连续失败: {error_msg}")
-                        auto_switch_node()
-                    else:
-                        print(f"[代理守护线程] 固定 IP 模式下代理不可用，正在尝试重启连接同一节点: {checked_node_id}", flush=True)
-                        try:
-                            connect_node(checked_node_id)
-                        except Exception as e:
-                            print(f"[代理守护线程] 重启固定节点失败: {e}", flush=True)
-        except Exception as e:
-            print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
-            log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
+            connection_policy_tick()
+        except Exception as exc:
+            log_to_json("ERROR", "Proxy", f"检测守护线程异常: {exc}")
         time.sleep(30)
 
 def active_node_pinger() -> None:
@@ -8897,6 +9073,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
+        elif effective_path == "/api/switch_settings":
+            try:
+                cfg = save_switch_settings(self.read_json_body())
+                self.send_json({"ok": True, "switch_policy": cfg["switch_policy"],
+                    "rotation_interval_seconds": cfg["rotation_interval_seconds"],
+                    "failover_enabled": cfg["failover_enabled"]})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/update_settings":
             try:
                 payload = self.read_json_body()
@@ -9327,6 +9513,9 @@ def main() -> None:
     write_json(
         STATE_FILE,
         {
+            "last_connection_node": previous_runtime_state.get("last_connection_node"),
+            "connection_started_at": 0,  # reset only after a new actual successful connection
+            "last_auto_switch_attempt_at": 0,
             "api_url": API_URL,
             "mirror_url": MIRROR_HTTPS_URL,
             "target_valid_nodes": TARGET_VALID_NODES,

@@ -458,6 +458,7 @@ def apply_ip_cache_entry(node: dict[str, Any], entry: dict[str, Any]) -> None:
         "ip_type_confidence",
         "ip_type_sources",
         "geo_country_short",
+        "geo_region", "geo_city", "geo_lat", "geo_lon",
     ):
         node[key] = entry.get(key, "")
 
@@ -495,7 +496,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         chunk = ips_to_query[i : i + chunk_size]
         payload = json.dumps(chunk).encode("utf-8")
         request = urllib.request.Request(
-            "http://ip-api.com/batch?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as,asname,proxy,hosting,mobile",
+            "http://ip-api.com/batch?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,lat,lon,isp,org,as,asname,proxy,hosting,mobile",
             data=payload,
             headers={
                 "Content-Type": "application/json",
@@ -535,6 +536,9 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                         "as_name": item.get("asname") or "",
                         "location": loc,
                         "geo_country_short": str(item.get("countryCode") or "").upper(),
+                        "geo_region": str(item.get("regionName") or ""),
+                        "geo_city": str(item.get("city") or ""),
+                        "geo_lat": item.get("lat"), "geo_lon": item.get("lon"),
                         "ip_type": ip_type,
                         "quality": quality,
                         "is_proxy": bool(item.get("proxy")),

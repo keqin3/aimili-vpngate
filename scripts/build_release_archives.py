@@ -22,8 +22,10 @@ RELEASE_FILES = [
     "node_sources.py",
     "public_proxy_pool.py",
     "node_pool.py",
+    "connection_policy.py",
     "upgrade.sh",
     "docs/FAST_POOL_UPGRADE.md",
+    "docs/STABLE_CONNECTION_UPGRADE.md",
     "Dockerfile",
     "compose.yaml",
 ]
