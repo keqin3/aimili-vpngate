@@ -2770,8 +2770,8 @@ def test_multiple_nodes(
     return list(updated_nodes_map.values())
 
 
-def start_bulk_probe_all_nodes() -> tuple[bool, str]:
-    """Start a non-blocking OpenVPN handshake test for every cached node."""
+def start_bulk_probe_all_nodes(requested_node_ids: list[str]) -> tuple[bool, str]:
+    """Start a non-blocking probe for an explicit snapshot of dashboard nodes."""
     global is_connecting, bulk_probe_thread
 
     if not maintenance_lock.acquire(blocking=False):
@@ -2781,12 +2781,30 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
         if is_connecting:
             maintenance_lock.release()
             return False, "当前已有连接或节点维护任务正在运行，请稍后再试"
-        node_ids = [str(node.get("id") or "").strip() for node in read_all_nodes()]
-        node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+        visible_nodes = {
+            str(node.get("id") or "").strip(): node
+            for node in read_all_nodes()
+            if str(node.get("id") or "").strip()
+        }
+        requested = list(dict.fromkeys(
+            str(node_id or "").strip() for node_id in requested_node_ids if str(node_id or "").strip()
+        ))
+        node_ids = [node_id for node_id in requested if node_id in visible_nodes]
         if not node_ids:
             maintenance_lock.release()
-            return False, "当前没有可测试的节点，请先更新节点"
+            return False, "当前没有可测试的已选网页节点，请重新选择"
         is_connecting = True
+
+    selected_types = {
+        str(visible_nodes[node_id].get("ip_type") or "unknown").lower()
+        for node_id in node_ids
+    }
+    if selected_types and selected_types <= {"residential", "mobile"}:
+        scope_label = "家庭宽带"
+    elif selected_types == {"hosting"}:
+        scope_label = "机房"
+    else:
+        scope_label = "已选"
 
     total = len(node_ids)
     started_at = time.time()
@@ -2800,7 +2818,7 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
             bulk_probe_unavailable=0,
             bulk_probe_started_at=started_at,
             bulk_probe_finished_at=0,
-            last_check_message=f"正在实测全部 {total} 个节点：0/{total}",
+            last_check_message=f"正在实测{scope_label} {total} 个网页节点：0/{total}",
         )
     except Exception:
         with lock:
@@ -2817,7 +2835,7 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
                 bulk_probe_available=available,
                 bulk_probe_unavailable=unavailable,
                 last_check_message=(
-                    f"正在实测全部节点：{completed}/{total}，"
+                    f"正在实测{scope_label}网页节点：{completed}/{total}，"
                     f"可用 {available}，不可用 {unavailable}"
                 ),
             )
@@ -2831,18 +2849,20 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
             pruned = 0
             if AUTO_PRUNE_FAILED_NODES and not stopped:
                 prune_result = delete_unavailable_nodes(
+                    node_ids,
                     min_failures=AUTO_PRUNE_FAILURE_THRESHOLD,
                     preserve_favorites=True,
                     reason=f"连续 {AUTO_PRUNE_FAILURE_THRESHOLD} 次真实握手失败，自动清理",
                 )
                 pruned = int(prune_result.get("deleted", 0) or 0)
                 public_prune = delete_unavailable_public_proxies(
+                    node_ids,
                     min_failures=AUTO_PRUNE_FAILURE_THRESHOLD,
                     preserve_favorites=True,
                 )
                 pruned += int(public_prune.get("deleted", 0) or 0)
             message = (
-                f"全部节点实测{'提前停止' if stopped else '完成'}："
+                f"{scope_label}网页节点实测{'提前停止' if stopped else '完成'}："
                 f"已测 {completed}/{total}，可用 {available}，不可用 {unavailable}"
                 + (f"，自动清理 {pruned} 个连续失败节点" if pruned else "")
             )
@@ -2887,7 +2907,7 @@ def start_bulk_probe_all_nodes() -> tuple[bool, str]:
         )
         maintenance_lock.release()
         raise
-    return True, f"已在后台启动全部 {total} 个节点的真实 OpenVPN 握手测试"
+    return True, f"已在后台启动 {total} 个{scope_label}网页节点的真实连接测试"
 
 
 def save_auto_residential_settings(enabled: Any, interval_seconds: Any) -> dict[str, Any]:
@@ -2926,11 +2946,11 @@ def save_auto_residential_settings(enabled: Any, interval_seconds: Any) -> dict[
 
 
 def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, str]:
-    """Test, latency-sort and safely prune failed residential/mobile nodes in background."""
+    """Probe and prune only the dashboard-node snapshot captured at task start."""
     global is_connecting, auto_residential_thread
 
     if auto_residential_thread is not None and auto_residential_thread.is_alive():
-        return False, "住宅节点自动整理任务已经在运行"
+        return False, "网页节点自动整理任务已经在运行"
     if not maintenance_lock.acquire(blocking=False):
         return False, "当前已有连接、更新或测速任务，自动整理稍后重试"
 
@@ -2938,18 +2958,14 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
         if is_connecting:
             maintenance_lock.release()
             return False, "当前已有连接、更新或测速任务，自动整理稍后重试"
-        vpn_node_ids = [
+        node_ids = list(dict.fromkeys(
             str(node.get("id") or "").strip()
-            for node in read_nodes()
-            if str(node.get("ip_type") or "").lower() in {"residential", "mobile"}
-        ]
-        public_candidates = [
-            node for node in read_public_proxies()
-            if str(node.get("ip_type") or "").lower() in {"residential", "mobile", "unknown"}
-        ]
-        public_candidates.sort(key=public_proxy_sort_key)
-        public_node_ids = [str(node.get("id") or "") for node in public_candidates[:PUBLIC_PROXY_AUTO_TEST_LIMIT]]
-        node_ids = list(dict.fromkeys(node_id for node_id in [*vpn_node_ids, *public_node_ids] if node_id))
+            for node in read_all_nodes()
+            if str(node.get("id") or "").strip()
+        ))
+        if not node_ids:
+            maintenance_lock.release()
+            return False, "当前网页没有可整理的节点，请先更新节点"
         is_connecting = True
 
     total = len(node_ids)
@@ -2961,15 +2977,15 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
         auto_residential_unavailable=0,
         auto_residential_deleted=0,
         auto_residential_duplicates=0,
-        auto_residential_message=f"正在更新、去重并准备实测住宅/公共代理节点：0/{total}",
-        last_check_message=f"正在更新、去重并准备实测 {total} 个节点",
+        auto_residential_message=f"正在准备实测当前网页的全部节点：0/{total}",
+        last_check_message=f"正在准备实测当前网页的 {total} 个节点",
     )
 
     def worker() -> None:
         global is_connecting
 
         def update_progress(completed: int, available: int, unavailable: int, _result: dict[str, Any]) -> None:
-            message = f"正在自动实测住宅节点：{completed}/{total}，可用 {available}，不可用 {unavailable}"
+            message = f"正在自动实测网页节点：{completed}/{total}，可用 {available}，不可用 {unavailable}"
             set_state(
                 auto_residential_tested=completed,
                 auto_residential_available=available,
@@ -2980,24 +2996,9 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
 
         finished_at = time.time()
         try:
-            refresh_result = refresh_public_proxy_pool()
-            refreshed_public = [
-                node for node in read_public_proxies()
-                if str(node.get("ip_type") or "").lower() in {"residential", "mobile", "unknown"}
-            ]
-            refreshed_public.sort(key=public_proxy_sort_key)
-            current_vpn_ids = [
-                str(node.get("id") or "") for node in read_nodes()
-                if str(node.get("ip_type") or "").lower() in {"residential", "mobile"}
-            ]
-            node_ids[:] = list(dict.fromkeys([
-                *current_vpn_ids,
-                *[str(node.get("id") or "") for node in refreshed_public[:PUBLIC_PROXY_AUTO_TEST_LIMIT]],
-            ]))
-            total = len(node_ids)
-            if not node_ids:
-                raise RuntimeError("更新后仍没有可检测的住宅或公共代理节点")
-            set_state(auto_residential_message=f"公共代理已去重 {refresh_result['duplicates_removed']} 个，开始实测 0/{total}")
+            # Do not refresh the source pool here. This run is deliberately bound
+            # to the exact set already exposed by /api/nodes when it started.
+            set_state(auto_residential_message=f"已锁定当前网页 {total} 个节点，开始实测 0/{total}")
             results = test_combined_nodes(node_ids, progress_callback=update_progress)
             completed = len(results)
             available = sum(item.get("probe_status") == "available" for item in results)
@@ -3006,21 +3007,22 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
             deleted = 0
             if not stopped:
                 cleanup = delete_unavailable_nodes(
+                    node_ids,
                     min_failures=AUTO_PRUNE_FAILURE_THRESHOLD,
                     preserve_favorites=True,
-                    ip_types={"residential", "mobile"},
                     reason=f"自动整理：连续 {AUTO_PRUNE_FAILURE_THRESHOLD} 次真实握手失败",
                 )
                 deleted = int(cleanup.get("deleted", 0) or 0)
                 public_cleanup = delete_unavailable_public_proxies(
+                    node_ids,
                     min_failures=AUTO_PRUNE_FAILURE_THRESHOLD,
                     preserve_favorites=True,
                 )
                 deleted += int(public_cleanup.get("deleted", 0) or 0)
             finished_at = time.time()
             message = (
-                f"住宅/公共代理自动整理{'提前停止' if stopped else '完成'}："
-                f"去重 {refresh_result['duplicates_removed']}，已测 {completed}/{total}，可用 {available}，不可用 {unavailable}，删除 {deleted}"
+                f"网页现有节点自动整理{'提前停止' if stopped else '完成'}："
+                f"已测 {completed}/{total}，可用 {available}，不可用 {unavailable}，删除 {deleted}"
             )
             cfg = load_ui_config()
             next_run = finished_at + int(cfg.get("auto_residential_interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL)) \
@@ -3033,7 +3035,7 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
                 auto_residential_available=available,
                 auto_residential_unavailable=unavailable,
                 auto_residential_deleted=deleted,
-                auto_residential_duplicates=refresh_result["duplicates_removed"],
+                auto_residential_duplicates=0,
                 auto_residential_message=message,
                 last_check_message=message,
             )
@@ -3043,7 +3045,7 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
             cfg = load_ui_config()
             next_run = finished_at + int(cfg.get("auto_residential_interval_seconds", DEFAULT_AUTO_RESIDENTIAL_INTERVAL)) \
                 if cfg.get("auto_residential_enabled") else 0
-            message = f"住宅节点自动整理失败: {exc}"
+            message = f"网页节点自动整理失败: {exc}"
             set_state(
                 auto_residential_running=False,
                 auto_residential_last_run_at=finished_at,
@@ -3071,7 +3073,7 @@ def start_auto_residential_maintenance(*, manual: bool = False) -> tuple[bool, s
         set_state(is_connecting=False, auto_residential_running=False)
         maintenance_lock.release()
         raise
-    return True, f"已启动住宅/OpenVPN 与公共代理池的更新、去重、测速、排序和失效清理"
+    return True, f"已启动当前网页 {total} 个节点的测速、排序和失效清理"
 
 
 def auto_residential_scheduler_loop() -> None:
@@ -3098,7 +3100,7 @@ def auto_residential_scheduler_loop() -> None:
                     set_state(auto_residential_message=message)
             time.sleep(30)
         except Exception as exc:
-            log_to_json("ERROR", "Scheduler", f"住宅节点自动整理调度异常: {exc}")
+            log_to_json("ERROR", "Scheduler", f"网页节点自动整理调度异常: {exc}")
             time.sleep(60)
 
 
@@ -5598,11 +5600,19 @@ INDEX_HTML = r"""<!doctype html>
       <option value="score_desc">来源评分优先</option>
       <option value="country_asc">国家排序</option>
     </select>
+    <div id="node_selection_toolbar" style="flex-basis:100%; width:100%; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px 12px; border:1px solid rgba(165,180,252,.2); background:rgba(99,102,241,.05); border-radius:9px; box-sizing:border-box;">
+      <strong id="selected_node_count" style="font-size:13px; color:#a5b4fc; margin-right:4px;">已选 0 个节点</strong>
+      <button class="toolbar-btn" type="button" onclick="selectNodesByIpType('residential')" style="height:34px; padding:0 11px;">全选家庭宽带</button>
+      <button class="toolbar-btn" type="button" onclick="selectNodesByIpType('hosting')" style="height:34px; padding:0 11px;">全选机房</button>
+      <button class="toolbar-btn" type="button" onclick="selectNodesByIpType('all')" style="height:34px; padding:0 11px;">全选机房 + 家庭宽带</button>
+      <button class="toolbar-btn" type="button" onclick="clearNodeSelection()" style="height:34px; padding:0 11px;">清空选择</button>
+      <span style="font-size:12px; color:var(--text-secondary);">测速和手动删除只作用于勾选节点；每行最左侧方框可单独调整。</span>
+    </div>
     <button id="btn_test_all" class="toolbar-btn" type="button" onclick="startAllNodeTest()" style="margin-left: auto; height: 42px; gap: 6px; border-color: rgba(16,185,129,.45); color: #34d399;">
       <svg id="test_all_icon" xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
       </svg>
-      <span id="test_all_label">一键实测全部</span>
+      <span id="test_all_label">实测已选节点</span>
     </button>
     <button id="btn_delete_unavailable" class="toolbar-btn" type="button" onclick="deleteUnavailableNodes()" style="height:42px; gap:6px; border-color:rgba(244,63,94,.45); color:#fb7185;">
       <span id="delete_unavailable_label">批量删除失效</span>
@@ -5625,7 +5635,7 @@ INDEX_HTML = r"""<!doctype html>
     <div id="auto_residential_panel" style="flex-basis:100%; width:100%; padding:14px; border:1px solid rgba(34,211,238,.25); background:rgba(34,211,238,.055); border-radius:10px; box-sizing:border-box; display:flex; flex-wrap:wrap; align-items:center; gap:10px;">
       <label style="display:flex; align-items:center; gap:8px; font-size:13px; font-weight:700; color:var(--text-primary);">
         <input id="auto_residential_enabled" type="checkbox" style="width:17px; height:17px; accent-color:#10b981;">
-        自动整理住宅/公共代理
+        自动整理网页现有全部节点
       </label>
       <select id="auto_residential_interval" aria-label="自动整理周期" style="height:38px;">
         <option value="3600">每 1 小时</option>
@@ -5636,7 +5646,7 @@ INDEX_HTML = r"""<!doctype html>
       </select>
       <button id="btn_save_auto_residential" class="toolbar-btn" type="button" onclick="saveAutoResidentialMaintenance()" style="height:38px; color:#22d3ee; border-color:rgba(34,211,238,.4);">保存设置</button>
       <button id="btn_run_auto_residential" class="toolbar-btn" type="button" onclick="runAutoResidentialMaintenanceNow()" style="height:38px; color:#34d399; border-color:rgba(16,185,129,.4);">立即整理一次</button>
-      <span id="auto_residential_status" style="flex:1 1 320px; min-width:240px; font-size:12px; line-height:1.6; color:var(--text-secondary);">自动整理未启用</span>
+      <span id="auto_residential_status" style="flex:1 1 320px; min-width:240px; font-size:12px; line-height:1.6; color:var(--text-secondary);">自动整理未启用；任务只锁定启动时网页已有节点，不测速新抓取候选池。</span>
       <span id="hosting_rotation_status" style="flex-basis:100%; font-size:12px; line-height:1.6; color:#fbbf24;">机房池：最多抓取 200 个，实测后保留最快 100 个，每 24 小时轮换。</span>
     </div>
   </section>
@@ -5671,6 +5681,7 @@ INDEX_HTML = r"""<!doctype html>
       <table>
         <thead>
           <tr>
+            <th style="width: 44px; text-align:center;"><input id="select_filtered_nodes" type="checkbox" aria-label="选择当前筛选结果中的全部节点" onchange="toggleFilteredNodeSelection(this.checked)" style="width:17px;height:17px;accent-color:#6366f1;"></th>
             <th style="width: 90px;">状态</th>
             <th style="width: 220px;">IP 地址 : 端口</th>
             <th style="width: 125px;">延迟</th>
@@ -5981,7 +5992,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </main>
 <script>
-let nodes=[], state={}, testingNodeIds = new Set();
+let nodes=[], state={}, testingNodeIds = new Set(), selectedNodeIds = new Set();
 const favoriteRequestIds = new Set();
 let disconnectInFlight = false;
 let currentPage = 1;
@@ -6405,6 +6416,41 @@ function stableSortNodes() {
   });
 }
 
+function toggleNodeSelection(nodeId, checked) {
+  const id = String(nodeId || "");
+  if (!id) return;
+  if (checked) selectedNodeIds.add(id);
+  else selectedNodeIds.delete(id);
+  render();
+}
+
+function selectNodesByIpType(scope) {
+  const selectable = nodes.filter(node => {
+    if (!node || !node.id) return false;
+    const ipType = String(node.ip_type || "unknown").toLowerCase();
+    if (scope === "residential") return ipType === "residential" || ipType === "mobile";
+    if (scope === "hosting") return ipType === "hosting";
+    return ["residential", "mobile", "hosting"].includes(ipType);
+  });
+  selectedNodeIds = new Set(selectable.map(node => String(node.id)));
+  render();
+}
+
+function clearNodeSelection() {
+  selectedNodeIds.clear();
+  render();
+}
+
+function toggleFilteredNodeSelection(checked) {
+  getFilteredNodes().forEach(node => {
+    const id = String(node && node.id || "");
+    if (!id) return;
+    if (checked) selectedNodeIds.add(id);
+    else selectedNodeIds.delete(id);
+  });
+  render();
+}
+
 function render(){
   const versionLabel = state.app_version_label || "V2.1.5 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
@@ -6415,10 +6461,10 @@ function render(){
   }
   updateBulkProbeUI();
   updateAutoResidentialUI();
-  const failedCount = nodes.filter(n => n && n.probe_status === "unavailable" && !n.active).length;
+  const failedCount = nodes.filter(n => n && selectedNodeIds.has(String(n.id || "")) && n.probe_status === "unavailable" && !n.active).length;
   const deleteButton = $("btn_delete_unavailable");
   const deleteLabel = $("delete_unavailable_label");
-  if (deleteLabel) deleteLabel.textContent = failedCount ? `批量删除失效 (${failedCount})` : "批量删除失效";
+  if (deleteLabel) deleteLabel.textContent = failedCount ? `删除已选失效 (${failedCount})` : "删除已选失效";
   if (deleteButton) {
     deleteButton.disabled = failedCount === 0 || Boolean(state.bulk_probe_running) || Boolean(state.maintenance_running) || Boolean(state.is_connecting);
     deleteButton.style.opacity = deleteButton.disabled ? "0.45" : "";
@@ -6508,6 +6554,15 @@ function render(){
   setHtmlIfChanged(activeCardContainer, activeCardHtml);
 
   const shown = getFilteredNodes();
+  const selectedCount = selectedNodeIds.size;
+  if ($("selected_node_count")) $("selected_node_count").textContent = `已选 ${selectedCount} 个节点`;
+  const selectFiltered = $("select_filtered_nodes");
+  if (selectFiltered) {
+    const shownIds = shown.map(node => String(node.id || "")).filter(Boolean);
+    const selectedShown = shownIds.filter(nodeId => selectedNodeIds.has(nodeId)).length;
+    selectFiltered.checked = shownIds.length > 0 && selectedShown === shownIds.length;
+    selectFiltered.indeterminate = selectedShown > 0 && selectedShown < shownIds.length;
+  }
   
   if ($("total")) $("total").textContent = nodes.length; 
   if ($("target")) $("target").textContent = state.target_valid_nodes || 3;
@@ -6583,7 +6638,7 @@ function render(){
   // Render table rows
   let rowsHtml = "";
   if (currentPageNodes.length === 0) {
-    rowsHtml = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    rowsHtml = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
     rowsHtml = currentPageNodes.map(n=>{
       if (!n) return '';
@@ -6623,6 +6678,7 @@ function render(){
         : `<button class="test-btn" ${favoriteBusy ? "disabled" : ""} style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">${favoriteBusy ? "处理中" : "☆ 收藏"}</button>`;
 
       return `<tr ${rowClass}>
+        <td style="text-align:center;"><input class="node-select-checkbox" type="checkbox" aria-label="选择节点 ${esc(n.ip||n.remote_host)}" data-node-id="${esc(n.id)}" ${selectedNodeIds.has(String(n.id || "")) ? "checked" : ""} onchange="toggleNodeSelection('${esc(n.id)}', this.checked)" style="width:17px;height:17px;accent-color:#6366f1;"></td>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(sourceTitle)}"><span style="font-size:10px;color:${n.node_kind === "public_proxy" ? "#22d3ee" : "#a5b4fc"};border:1px solid currentColor;border-radius:4px;padding:1px 4px;margin-right:6px;">${esc(transportLabel)}</span>${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
         <td style="white-space: nowrap;">${latencyText}</td>
@@ -6751,6 +6807,8 @@ function applyNodesSnapshot(data) {
   lastNodesSnapshotSignature = signature;
   nodes = nextNodes;
   state = nextState;
+  const currentIds = new Set(nodes.filter(Boolean).map(node => String(node.id || "")).filter(Boolean));
+  selectedNodeIds = new Set(Array.from(selectedNodeIds).filter(nodeId => currentIds.has(nodeId)));
   stableSortNodes();
   updateCountryFilter();
   render();
@@ -6772,16 +6830,18 @@ function updateBulkProbeUI() {
   const percent = total > 0 ? Math.min(100, Math.round(completed * 100 / total)) : 0;
   const hasResult = Boolean(state.bulk_probe_finished_at) && total > 0;
 
-  btn.disabled = running || Boolean(state.maintenance_running) || Boolean(state.is_connecting);
+  btn.disabled = selectedNodeIds.size === 0 || running || Boolean(state.maintenance_running) || Boolean(state.is_connecting);
   btn.style.opacity = btn.disabled ? "0.6" : "";
-  btn.style.cursor = btn.disabled ? "wait" : "pointer";
-  label.textContent = running ? `实测中 ${completed}/${total}` : (hasResult ? "重新实测全部" : "一键实测全部");
+  btn.style.cursor = running || Boolean(state.maintenance_running) || Boolean(state.is_connecting)
+    ? "wait"
+    : (selectedNodeIds.size === 0 ? "not-allowed" : "pointer");
+  label.textContent = running ? `实测中 ${completed}/${total}` : `实测已选节点 (${selectedNodeIds.size})`;
   if (icon) icon.style.animation = running ? "spin 1s linear infinite" : "";
 
   panel.hidden = !(running || hasResult);
   if (!panel.hidden) {
     $("bulk_test_progress_text").textContent = running
-      ? `OpenVPN 真实握手测试 ${completed}/${total} · 可用 ${available} · 不可用 ${unavailable}`
+      ? `真实连接测试 ${completed}/${total} · 可用 ${available} · 不可用 ${unavailable}`
       : `实测结束 ${completed}/${total} · 可用 ${available} · 不可用 ${unavailable}`;
     $("bulk_test_progress_percent").textContent = `${percent}%`;
     $("bulk_test_progress_bar").style.width = `${percent}%`;
@@ -6814,17 +6874,17 @@ function updateAutoResidentialUI() {
     runButton.textContent = running ? "自动整理中…" : "立即整理一次";
   }
   if (running) {
-    status.textContent = state.auto_residential_message || "正在自动测速、低延迟排序并清理失效住宅节点…";
+    status.textContent = state.auto_residential_message || "正在自动测速、排序并清理网页现有失效节点…";
     status.style.color = "#34d399";
   } else if (state.auto_residential_enabled) {
     const last = Number(state.auto_residential_last_run_at) ? `上次：${formatScheduleTime(state.auto_residential_last_run_at)}；` : "尚未执行；";
     const summary = Number(state.auto_residential_last_run_at)
-      ? `上轮跨源去重 ${Number(state.auto_residential_duplicates) || 0}，已测 ${Number(state.auto_residential_tested) || 0}，可用 ${Number(state.auto_residential_available) || 0}，失效 ${Number(state.auto_residential_unavailable) || 0}，删除 ${Number(state.auto_residential_deleted) || 0}；`
+      ? `上轮已测 ${Number(state.auto_residential_tested) || 0}，可用 ${Number(state.auto_residential_available) || 0}，失效 ${Number(state.auto_residential_unavailable) || 0}，删除 ${Number(state.auto_residential_deleted) || 0}；`
       : "";
     status.textContent = `自动整理已启用。${last}${summary}下次：${formatScheduleTime(state.auto_residential_next_run_at)}`;
     status.style.color = "#22d3ee";
   } else {
-    status.textContent = "自动整理未启用；启用后会定时更新多来源公共池、跨源去重、真实出口测速、低延迟排序并删除连续失效节点。收藏节点和当前活动节点不会被自动删除。";
+    status.textContent = "自动整理未启用；启用后只会锁定任务开始时网页现有的全部节点进行测速、排序并删除连续失效节点，不会把新抓取候选池加入本轮。收藏节点和当前活动节点不会被自动删除。";
     status.style.color = "var(--text-secondary)";
   }
   const hostingStatus = $("hosting_rotation_status");
@@ -6873,7 +6933,7 @@ async function runAutoResidentialMaintenanceNow() {
     await load();
     startBulkProbePolling();
   } catch (error) {
-    alert("启动住宅节点整理失败: " + (error.message || "未知错误"));
+    alert("启动网页节点整理失败: " + (error.message || "未知错误"));
     try { await load(); } catch (loadError) { render(); }
   }
 }
@@ -6902,16 +6962,24 @@ function startBulkProbePolling() {
 
 async function startAllNodeTest() {
   if (state.bulk_probe_running || state.auto_residential_running) return;
-  if (!nodes.length) {
-    alert("当前没有节点，请先点击更新节点");
+  const selectedIds = Array.from(selectedNodeIds);
+  if (!selectedIds.length) {
+    alert("请先勾选要测速的节点，或使用“全选家庭宽带 / 全选机房 / 全选机房 + 家庭宽带”。");
     return;
   }
-  if (!confirm(`将对全部 ${nodes.length} 个节点执行真实 OpenVPN 握手测试。测试可能持续数分钟，是否继续？`)) return;
+  const selectedNodes = nodes.filter(node => node && selectedNodeIds.has(String(node.id || "")));
+  const residentialCount = selectedNodes.filter(node => ["residential", "mobile"].includes(String(node.ip_type || "").toLowerCase())).length;
+  const hostingCount = selectedNodes.filter(node => String(node.ip_type || "").toLowerCase() === "hosting").length;
+  if (!confirm(`只对当前勾选的 ${selectedIds.length} 个网页节点执行真实连接测试（家庭宽带 ${residentialCount}，机房 ${hostingCount}）。测试可能持续数分钟，是否继续？`)) return;
 
   const btn = $("btn_test_all");
   if (btn) btn.disabled = true;
   try {
-    const response = await fetchWithTimeout("./api/test_all_nodes", { method: "POST" }, 25000);
+    const response = await fetchWithTimeout("./api/test_all_nodes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: selectedIds })
+    }, 25000);
     const result = await readJsonResponse(response, "启动全部节点实测失败");
     if (!result.ok) throw new Error(result.error || "启动失败");
     await load();
@@ -6923,19 +6991,23 @@ async function startAllNodeTest() {
 }
 
 async function deleteUnavailableNodes() {
-  const failedCount = nodes.filter(n => n && n.probe_status === "unavailable" && !n.active).length;
+  const failedIds = nodes
+    .filter(n => n && selectedNodeIds.has(String(n.id || "")) && n.probe_status === "unavailable" && !n.active)
+    .map(n => String(n.id || ""))
+    .filter(Boolean);
+  const failedCount = failedIds.length;
   if (!failedCount) {
-    alert("当前没有已确认失效的节点。请先执行一键实测全部。");
+    alert("当前勾选范围内没有已确认失效的节点。请先勾选并测速。");
     return;
   }
-  if (!confirm(`将批量删除 ${failedCount} 个真实握手失败节点，并临时加入黑名单避免马上被重新导入。是否继续？`)) return;
+  if (!confirm(`只删除当前勾选范围内 ${failedCount} 个真实连接失败节点，并临时加入黑名单避免马上被重新导入。是否继续？`)) return;
   const btn = $("btn_delete_unavailable");
   if (btn) btn.disabled = true;
   try {
     const response = await fetchWithTimeout("./api/delete_unavailable_nodes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ all: true })
+      body: JSON.stringify({ ids: failedIds })
     }, 30000);
     const result = await readJsonResponse(response, "批量删除失效节点失败");
     if (!response.ok || !result.ok) throw new Error(result.error || "删除失败");
@@ -8777,7 +8849,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({
                     "ok": True,
                     **settings,
-                    "message": f"住宅节点自动整理{action}，周期：{settings['interval_label']}",
+                    "message": f"网页现有节点自动整理{action}，周期：{settings['interval_label']}",
                 })
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -8795,8 +8867,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_all_nodes":
             try:
-                self.read_request_body()
-                started, message = start_bulk_probe_all_nodes()
+                payload = self.read_json_body(max_bytes=524288)
+                node_ids = payload.get("ids")
+                if not isinstance(node_ids, list) or not node_ids:
+                    self.send_json({"ok": False, "error": "请选择当前网页中的待测速节点"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if len(node_ids) > 10000:
+                    self.send_json({"ok": False, "error": "单次最多测试 10000 个网页节点"}, HTTPStatus.BAD_REQUEST)
+                    return
+                started, message = start_bulk_probe_all_nodes(node_ids)
                 if not started:
                     self.send_json({"ok": False, "error": message}, HTTPStatus.CONFLICT)
                     return
@@ -8808,17 +8887,17 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self.read_json_body(max_bytes=262144)
                 node_ids = payload.get("ids")
-                if node_ids is not None and not isinstance(node_ids, list):
-                    self.send_json({"ok": False, "error": "节点 ID 列表无效"}, HTTPStatus.BAD_REQUEST)
+                if not isinstance(node_ids, list) or not node_ids:
+                    self.send_json({"ok": False, "error": "请选择当前网页中的待删除节点"}, HTTPStatus.BAD_REQUEST)
                     return
-                if isinstance(node_ids, list) and len(node_ids) > 5000:
+                if len(node_ids) > 5000:
                     self.send_json({"ok": False, "error": "单次最多删除 5000 个节点"}, HTTPStatus.BAD_REQUEST)
                     return
                 acquired = maintenance_lock.acquire(blocking=False)
                 if not acquired:
                     self.send_json({"ok": False, "error": "当前正在连接、更新或测速，请稍后再删除"}, HTTPStatus.CONFLICT)
                     return
-                requested_ids = [str(item or "").strip() for item in node_ids] if isinstance(node_ids, list) else None
+                requested_ids = [str(item or "").strip() for item in node_ids]
                 vpn_result = delete_unavailable_nodes(
                     requested_ids,
                     reason="面板批量删除失效节点",

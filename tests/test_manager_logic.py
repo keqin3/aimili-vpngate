@@ -381,7 +381,7 @@ class ManagerLogicTests(unittest.TestCase):
             return results
 
         with mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test):
-            started, message = manager.start_bulk_probe_all_nodes()
+            started, message = manager.start_bulk_probe_all_nodes([node["id"] for node in nodes])
             self.assertTrue(started)
             self.assertIn("2", message)
             thread = manager.bulk_probe_thread
@@ -394,6 +394,33 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(1, state["bulk_probe_available"])
         self.assertEqual(1, state["bulk_probe_unavailable"])
         self.assertFalse(manager.maintenance_lock.locked())
+
+    def test_bulk_probe_and_auto_prune_stay_inside_requested_dashboard_selection(self) -> None:
+        nodes = self.write_nodes(3)
+        nodes[0].update({"probe_status": "available", "consecutive_failures": 0})
+        nodes[1].update({"probe_status": "unavailable", "consecutive_failures": 2})
+        nodes[2].update({"probe_status": "unavailable", "consecutive_failures": 2})
+        manager.write_json(manager.NODES_FILE, nodes)
+        requested = [nodes[0]["id"], nodes[1]["id"]]
+
+        results = [
+            {"id": nodes[0]["id"], "probe_status": "available"},
+            {"id": nodes[1]["id"], "probe_status": "unavailable"},
+        ]
+        with (
+            mock.patch.object(manager, "test_combined_nodes", return_value=results) as test_mock,
+            mock.patch.object(manager, "AUTO_PRUNE_FAILED_NODES", True),
+            mock.patch.object(manager, "AUTO_PRUNE_FAILURE_THRESHOLD", 2),
+        ):
+            started, _ = manager.start_bulk_probe_all_nodes(requested)
+            self.assertTrue(started)
+            manager.bulk_probe_thread.join(timeout=2)
+
+        test_mock.assert_called_once()
+        self.assertEqual(requested, test_mock.call_args.args[0])
+        remaining = {node["id"] for node in manager.read_nodes()}
+        self.assertNotIn(nodes[1]["id"], remaining)
+        self.assertIn(nodes[2]["id"], remaining)
 
     def test_probe_health_counts_repeat_failures_and_resets_on_success(self) -> None:
         node = {"id": "node-1", "consecutive_failures": 1}
@@ -451,7 +478,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(2, result["deleted"])
         self.assertEqual({nodes[2]["id"]}, {node["id"] for node in manager.read_nodes()})
 
-    def test_auto_residential_maintenance_only_tests_target_types_and_prunes_failures(self) -> None:
+    def test_auto_maintenance_tests_only_startup_dashboard_snapshot_and_prunes_failures(self) -> None:
         nodes = self.write_nodes(3)
         nodes[0].update({"ip_type": "residential", "consecutive_failures": 0})
         nodes[1].update({"ip_type": "mobile", "consecutive_failures": 1})
@@ -477,22 +504,19 @@ class ManagerLogicTests(unittest.TestCase):
 
         with (
             mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test),
-            mock.patch.object(
-                manager,
-                "refresh_public_proxy_pool",
-                return_value={"duplicates_removed": 0, "message": "ok"},
-            ),
+            mock.patch.object(manager, "refresh_public_proxy_pool") as refresh_mock,
         ):
             started, _ = manager.start_auto_residential_maintenance(manual=True)
             self.assertTrue(started)
             manager.auto_residential_thread.join(timeout=2)
 
-        self.assertEqual({nodes[0]["id"], nodes[1]["id"]}, set(tested_ids))
+        self.assertEqual({node["id"] for node in nodes}, set(tested_ids))
+        refresh_mock.assert_not_called()
         remaining = {node["id"] for node in manager.read_nodes()}
         self.assertIn(nodes[0]["id"], remaining)
         self.assertNotIn(nodes[1]["id"], remaining)
-        self.assertIn(nodes[2]["id"], remaining)
-        self.assertEqual(1, manager.get_state()["auto_residential_deleted"])
+        self.assertNotIn(nodes[2]["id"], remaining)
+        self.assertEqual(2, manager.get_state()["auto_residential_deleted"])
         self.assertFalse(manager.maintenance_lock.locked())
 
     def test_ip_classification_separates_proxy_use_from_network_type(self) -> None:
@@ -1109,13 +1133,13 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_node_table_contains_latency_country_panel_and_test_action(self) -> None:
         self.assertIn('<th style="width: 125px;">延迟</th>', manager.INDEX_HTML)
-        self.assertIn('colspan="7"', manager.INDEX_HTML)
+        self.assertIn('colspan="8"', manager.INDEX_HTML)
         self.assertIn('class="country-option-input"', manager.INDEX_HTML)
         self.assertIn('${testBtn}', manager.INDEX_HTML)
         self.assertIn('id="btn_test_all"', manager.INDEX_HTML)
         self.assertIn('id="bulk_test_progress"', manager.INDEX_HTML)
         self.assertIn('./api/test_all_nodes', manager.INDEX_HTML)
-        self.assertIn('OpenVPN 真实握手测试', manager.INDEX_HTML)
+        self.assertIn('真实连接测试', manager.INDEX_HTML)
         self.assertIn('id="sort_filter"', manager.INDEX_HTML)
         self.assertIn('value="latency_asc">低延迟优先', manager.INDEX_HTML)
         self.assertIn('id="btn_delete_unavailable"', manager.INDEX_HTML)
@@ -1126,6 +1150,11 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('value="604800">每 1 周', manager.INDEX_HTML)
         self.assertIn('./api/auto_residential_maintenance', manager.INDEX_HTML)
         self.assertIn('./api/run_auto_residential_maintenance', manager.INDEX_HTML)
+        self.assertIn('id="select_filtered_nodes"', manager.INDEX_HTML)
+        self.assertIn('全选家庭宽带', manager.INDEX_HTML)
+        self.assertIn('全选机房 + 家庭宽带', manager.INDEX_HTML)
+        self.assertIn('JSON.stringify({ ids: selectedIds })', manager.INDEX_HTML)
+        self.assertIn('JSON.stringify({ ids: failedIds })', manager.INDEX_HTML)
 
     def test_web_dashboard_has_browser_freeze_safeguards(self) -> None:
         self.assertNotIn("backdrop-filter", manager.LOGIN_HTML)
