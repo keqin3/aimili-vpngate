@@ -79,7 +79,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/keqin3/aimili-vpngate/main/u
 
 该命令同时用于首次安装和后续升级。升级前会在 `/opt` 下生成带时间戳的备份，保留 `vpngate_data` 配置与缓存，并把 Git 更新源固定为 `keqin3/aimili-vpngate`。
 
-本分支默认设置 `MAX_SCAN_ROWS=0`，含义是读取 VPNGate 快照返回的全部候选，不再截断前 300/1000 条；实际住宅节点数量仍取决于上游当时提供的节点和 IP 情报接口可用性。
+本分支后台仍可读取完整 VPNGate 快照，但网页和工作节点文件只保留有限池：住宅目标 `200`、机房目标 `50`，另有最多 `60` 个待确认候选。候选缓存独立于网页列表；上游不足时显示实际缺额，不伪造住宅分类。
 
 本分支还会并行聚合 `vpngate`、`ipspeed`、`vpngate_scraper` 和持续自动更新的 `auto_ovpn` 四个 OpenVPN 兼容来源。不同来源可能包含同一台 VPNGate 志愿节点，程序会按 `remote host + port + protocol` 去重；增加的是抓取覆盖率、更新及时性和故障切换能力，不会把重复镜像伪装成新的独立住宅池。外部 `.ovpn` 会经过 HTTPS 主机白名单、响应大小限制和安全指令校验后才进入候选队列。
 
@@ -88,26 +88,41 @@ bash <(curl -fsSL https://raw.githubusercontent.com/keqin3/aimili-vpngate/main/u
 ```bash
 sudo tee /etc/default/aimilivpn >/dev/null <<'EOF'
 NODE_SOURCES=vpngate,ipspeed,vpngate_scraper,auto_ovpn
-EXTERNAL_SOURCE_MAX_PROFILES=300
+EXTERNAL_SOURCE_MAX_PROFILES=40
 AUTO_PRUNE_FAILED_NODES=1
 AUTO_PRUNE_FAILURE_THRESHOLD=2
 PUBLIC_PROXY_REFRESH_SECONDS=3600
-PUBLIC_PROXY_AUTO_TEST_LIMIT=500
+PUBLIC_PROXY_AUTO_TEST_LIMIT=20
 PUBLIC_PROXY_PROBE_WORKERS=20
 HOSTING_CANDIDATE_LIMIT=200
-HOSTING_RETAIN_LIMIT=100
-HOSTING_ROTATION_SECONDS=86400
+HOSTING_RETAIN_LIMIT=50
+RESIDENTIAL_RETAIN_LIMIT=200
+POOL_PENDING_LIMIT=60
+POOL_PROBE_BATCH=20
+POOL_CHECK_SECONDS=300
+POOL_REFILL_RETRY_SECONDS=900
 EOF
 sudo systemctl restart aimilivpn
 ```
 
-`EXTERNAL_SOURCE_MAX_PROFILES=0` 表示外部来源不设条数上限，但会显著增加下载、验证和探测耗时；通常先用 `300`，确认服务器带宽和 CPU 余量后再提高。只使用原始来源时可设 `NODE_SOURCES=vpngate`。
+`EXTERNAL_SOURCE_MAX_PROFILES=0` 表示外部来源不设条数上限，但会显著增加下载、验证和探测耗时；默认先用 `40`，确认服务器带宽和 CPU 余量后再提高。只使用原始来源时可设 `NODE_SOURCES=vpngate`。
 
 除 OpenVPN 来源外，本分支还独立聚合 **M1noa、maximilianfeix、ProxyScrape、stormsia、HProxy、Databay 和 Geonode** 的公开 HTTP/SOCKS5 候选。它们不会被伪装成 `.ovpn`：程序按 `protocol + host + port` 跨来源去重，通过代理隧道完成 TLS 与真实出口 IP 验证，再使用现有 IP 情报对出口做住宅/移动/机房分类。选择通过检测的公共代理后，本机 `7928` HTTP/SOCKS5 网关会把流量转发到该上游。
 
 `PUBLIC_PROXY_REFRESH_SECONDS` 控制公开池更新周期；`PUBLIC_PROXY_AUTO_TEST_LIMIT` 限制每轮自动实测数量（不是抓取/存储上限）；`PUBLIC_PROXY_PROBE_WORKERS` 控制并发探测数。面板可按“OpenVPN 节点 / 公共 HTTP/SOCKS”筛选，并显示每个候选的传输协议与来源。
 
-机房 IP 使用独立的轻量池策略：每 24 小时重新开放最多 `200` 个候选，对候选执行真实连接测试，然后按照“可用状态 → 实测延迟 → 完整握手耗时 → 来源速度/在线率”保留最快的 `100` 个。普通刷新和面板加载只保留筛选后的 100 个机房节点，住宅/移动节点不受此上限影响。当前活动节点与收藏节点受保护。对应环境变量为 `HOSTING_CANDIDATE_LIMIT`、`HOSTING_RETAIN_LIMIT` 和 `HOSTING_ROTATION_SECONDS`。
+### V2.1.6 快速加载与换批
+
+- 页面立即读取服务器缓存，不等待来源下载、IP 情报查询或节点握手；列表每页 **50 条**。请求支持 gzip，节点 JSON 使用按文件修改时间失效的内存缓存。
+- 默认 **200 个住宅 IP + 50 个机房 IP**。这是分类后的保留目标，不是保证 250 个节点实时可连；面板分别显示缺额、待确认数及已测可用数。移动/未知 IP 不算住宅。
+- 后台每 5 分钟最多实测 20 个最久未检测的节点；连续两次真实失败才移除并补位。健康池满时不刷新来源，也不再执行 24 小时整池轮换。
+- “更新节点”刷新候选、只补缺额，保留当前批次。“换下一批（IP 不重复）”用新 IP 替换普通节点，保留活动、收藏及固定节点；新候选不足则显示缺额，无任何新 IP 时保留原批次。
+- IP/域名及已验证出口别名存入 `vpngate_data/pool_history.json`（Docker 为 `/data/pool_history.json`），重启后仍去重，不会到期自动重用。不要删此文件，否则失去历史去重；它不会随网页响应下发。
+- 独立候选缓存 `pool_candidates.json` 默认最多 2000 个，待确认窗口最多 60 个。每轮只分类/探测一小批；第一次冷启动或大批换批需要后台逐步填满，不阻塞页面。
+- 活动/收藏/固定节点是保护例外，可能导致相应类别超过目标；想完全换掉它们，需先解除收藏/固定并断开活动节点。
+- `/api/nodes?page=1&page_size=50` 提供可选服务端分页；不带参数保持旧客户端兼容，返回有限工作池，前端仍可全池筛选。
+
+详细升级、参数和回滚说明：[快速加载升级指南](docs/FAST_POOL_UPGRADE.md)。
 
 > [!WARNING]
 > 公开免费代理由陌生第三方运行，随时可能失效，也可能观察连接元数据和未加密 HTTP 内容；来源标注的“住宅”通常只是 ASN 推断。程序会保留 HTTPS 证书校验并二次验证出口，但这不能把公开代理变成可信线路。不要通过它传输密码、Cookie、支付数据或其他敏感信息。

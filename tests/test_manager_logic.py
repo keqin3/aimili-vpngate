@@ -1242,8 +1242,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("2.1.5", manager.APP_VERSION)
-        self.assertEqual("V2.1.5 正式版", manager.APP_VERSION_LABEL)
+        self.assertEqual("2.1.6", manager.APP_VERSION)
+        self.assertEqual("V2.1.6 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -1326,7 +1326,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V2.1.5 正式版", result["current_version_label"])
+        self.assertEqual("V2.1.6 正式版", result["current_version_label"])
 
     def test_latest_release_check_reports_source_update_command(self) -> None:
         release = {"tag_name": "v2.2.0", "draft": False, "prerelease": False}

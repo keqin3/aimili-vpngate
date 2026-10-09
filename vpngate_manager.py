@@ -62,6 +62,9 @@ import vpn_utils
 import proxy_server
 import snapshot_utils
 import node_sources
+import node_pool
+import copy
+import gzip
 import public_proxy_pool
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
@@ -146,7 +149,7 @@ AUTO_OVPN_RAW_BASE_URL = os.environ.get(
     "AUTO_OVPN_RAW_BASE_URL",
     "https://raw.githubusercontent.com/9xN/auto-ovpn/main/",
 ).strip()
-EXTERNAL_SOURCE_MAX_PROFILES = env_optional_limit("EXTERNAL_SOURCE_MAX_PROFILES", 300)
+EXTERNAL_SOURCE_MAX_PROFILES = env_optional_limit("EXTERNAL_SOURCE_MAX_PROFILES", 40)
 EXTERNAL_SOURCE_WORKERS = env_int("EXTERNAL_SOURCE_WORKERS", 6, 1, 12)
 EXTERNAL_SOURCE_TIMEOUT_SECONDS = env_int("EXTERNAL_SOURCE_TIMEOUT_SECONDS", 15, 2, 60)
 # Kept as the primary URL for diagnostics and backwards-compatible state output.
@@ -165,11 +168,17 @@ INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 24, 1, 100)
 NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
 PUBLIC_PROXY_PROBE_WORKERS = env_int("PUBLIC_PROXY_PROBE_WORKERS", 20, 1, 64)
 PUBLIC_PROXY_REFRESH_SECONDS = env_int("PUBLIC_PROXY_REFRESH_SECONDS", 3600, 300, 86400)
-PUBLIC_PROXY_AUTO_TEST_LIMIT = env_int("PUBLIC_PROXY_AUTO_TEST_LIMIT", 500, 10, 5000)
+PUBLIC_PROXY_AUTO_TEST_LIMIT = env_int("PUBLIC_PROXY_AUTO_TEST_LIMIT", 20, 10, 5000)
 HOSTING_CANDIDATE_LIMIT = env_int("HOSTING_CANDIDATE_LIMIT", 200, 1, 2000)
-HOSTING_RETAIN_LIMIT = env_int("HOSTING_RETAIN_LIMIT", 100, 1, 1000)
+HOSTING_RETAIN_LIMIT = env_int("HOSTING_RETAIN_LIMIT", 50, 1, 1000)
 HOSTING_ROTATION_SECONDS = env_int("HOSTING_ROTATION_SECONDS", 86400, 3600, 604800)
 HOSTING_RETAIN_LIMIT = min(HOSTING_RETAIN_LIMIT, HOSTING_CANDIDATE_LIMIT)
+RESIDENTIAL_RETAIN_LIMIT = env_int("RESIDENTIAL_RETAIN_LIMIT", 200, 1, 5000)
+POOL_PENDING_LIMIT = env_int("POOL_PENDING_LIMIT", 60, 1, 500)
+POOL_PROBE_BATCH = env_int("POOL_PROBE_BATCH", 20, 1, 100)
+POOL_RESERVE_LIMIT = env_int("POOL_RESERVE_LIMIT", 2000, 250, 10000)
+POOL_CHECK_SECONDS = env_int("POOL_CHECK_SECONDS", 300, 30, 86400)
+POOL_REFILL_RETRY_SECONDS = env_int("POOL_REFILL_RETRY_SECONDS", 900, 60, 86400)
 PROXY_FAILURE_THRESHOLD = env_int("PROXY_FAILURE_THRESHOLD", 3, 1, 10)
 SWITCH_PREFLIGHT_MAX_AGE_SECONDS = env_int("SWITCH_PREFLIGHT_MAX_AGE_SECONDS", 180, 0, 3600)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
@@ -252,6 +261,8 @@ last_checker_heartbeat = 0.0
 last_pinger_heartbeat = 0.0
 server_start_time = time.time()
 ip_enrichment_wakeup = threading.Event()
+pool_job_thread: threading.Thread | None = None
+_json_cache: dict[str, tuple[tuple[int, int, int], Any]] = {}
 
 IP_ENRICHMENT_FIELDS = (
     "owner",
@@ -322,6 +333,7 @@ def write_json(path: Path, data: Any) -> None:
             except OSError:
                 pass
         tmp.replace(path)
+        _json_cache.pop(str(path.resolve()), None)
         if path.name == "ui_auth.json":
             try:
                 path.chmod(0o600)
@@ -331,7 +343,17 @@ def write_json(path: Path, data: Any) -> None:
 def read_json(path: Path, default: Any) -> Any:
     with lock:
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+            key = str(path.resolve())
+            cached = _json_cache.get(key)
+            if cached and cached[0] == stamp:
+                return copy.deepcopy(cached[1])
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if len(_json_cache) >= 32:
+                _json_cache.clear()
+            _json_cache[key] = (stamp, data)
+            return copy.deepcopy(data)
         except (OSError, json.JSONDecodeError):
             return default
 
@@ -673,6 +695,9 @@ def get_state() -> dict[str, Any]:
     state.setdefault("hosting_tested", 0)
     state.setdefault("hosting_available", 0)
     state.setdefault("hosting_message", "")
+    state["pool_job_running"] = bool(pool_job_thread and pool_job_thread.is_alive())
+    state["residential_retain_limit"] = RESIDENTIAL_RETAIN_LIMIT
+    state.setdefault("pool_message", "缓存优先；后台按缺额补齐节点")
     state["fav_fail_fallback"] = False
     
     return state
@@ -1749,8 +1774,17 @@ def fetch_external_candidates(source_name: str) -> list[dict[str, Any]]:
     else:
         raise ValueError(f"不支持的外部节点源: {source_name}")
 
-    if EXTERNAL_SOURCE_MAX_PROFILES is not None:
-        records = records[:EXTERNAL_SOURCE_MAX_PROFILES]
+    if EXTERNAL_SOURCE_MAX_PROFILES is not None and records:
+        # Cycle a bounded download window instead of always redownloading the
+        # first 40 profiles, which would starve later batches forever.
+        cursor_path = DATA_DIR / "source_cursors.json"
+        with lock:
+            cursors = read_json(cursor_path, {})
+            offset = int(cursors.get(source_name) or 0) % len(records)
+            count = min(EXTERNAL_SOURCE_MAX_PROFILES, len(records))
+            records = (records[offset:] + records[:offset])[:count]
+            cursors[source_name] = offset + count
+            write_json(cursor_path, cursors)
     blacklist = load_blacklist()
 
     def download(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -3690,9 +3724,9 @@ def maintain_valid_nodes(force: bool = False, hosting_limit: int = HOSTING_RETAI
             merged: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
             
-            if active_node:
-                merged.append(active_node)
-                seen_ids.add(active_node["id"])
+            for retained in current_nodes:
+                merged.append(retained)
+                seen_ids.add(retained["id"])
                 
             for cand in candidates:
                 if cand["id"] not in seen_ids:
@@ -3722,6 +3756,11 @@ def maintain_valid_nodes(force: bool = False, hosting_limit: int = HOSTING_RETAI
                     merged.append(cand)
                     seen_ids.add(cand["id"])
                     
+            merged, _ = node_pool.select_pool(
+                current_nodes, merged, pool_history(), pool_protected_ids(),
+                RESIDENTIAL_RETAIN_LIMIT, HOSTING_RETAIN_LIMIT, POOL_PENDING_LIMIT,
+                failure_threshold=AUTO_PRUNE_FAILURE_THRESHOLD,
+            )
             for n in merged:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
@@ -3880,67 +3919,230 @@ def maintain_valid_nodes(force: bool = False, hosting_limit: int = HOSTING_RETAI
         maintenance_lock.release()
 
 
+def pool_history() -> set[str]:
+    raw = read_json(DATA_DIR / "pool_history.json", [])
+    return {str(item) for item in raw} if isinstance(raw, list) else set()
+
+
+def pool_protected_ids() -> set[str]:
+    cfg = load_ui_config()
+    return {str(item) for item in [
+        *cfg.get("favorite_node_ids", []), cfg.get("fixed_node_id", ""),
+        active_openvpn_node_id, active_public_proxy_id,
+    ] if item}
+
+
+def persist_pool(nodes: list[dict[str, Any]], counts: dict[str, int]) -> None:
+    """Publish a bounded snapshot; history is independent of the temporary blacklist."""
+    with lock:
+        history = pool_history()
+        for node in nodes:
+            history.update(node_pool.ip_keys(node))
+            if node.get("node_kind") != "public_proxy" and node.get("config_text"):
+                config = Path(str(node.get("config_file") or ""))
+                if config.parent.resolve() == CONFIG_DIR.resolve() and not config.exists():
+                    config.write_text(node["config_text"], encoding="utf-8")
+        write_json(DATA_DIR / "pool_history.json", sorted(history))
+        write_json(NODES_FILE, sort_all_nodes([n for n in nodes if n.get("node_kind") != "public_proxy"]))
+        write_json(PUBLIC_PROXIES_FILE, sorted(
+            [n for n in nodes if n.get("node_kind") == "public_proxy"], key=public_proxy_sort_key))
+        set_state(pool_counts=counts, public_proxy_count=sum(n.get("node_kind") == "public_proxy" for n in nodes),
+                  hosting_pool_count=counts["hosting"], pool_history_count=len(history))
+
+
+def run_pool_maintenance(rotate: bool = False, refresh: bool = False, lock_held: bool = False) -> None:
+    """All network/probing work is background-only, outside the snapshot I/O lock."""
+    global is_connecting
+    if not lock_held and not maintenance_lock.acquire(blocking=False):
+        return
+    owns_busy = False
+    try:
+        with lock:
+            if is_connecting:
+                return
+            is_connecting = True
+            owns_busy = True
+        ensure_dirs()
+        protected = pool_protected_ids()
+        current = read_all_nodes()
+        active_id = active_public_proxy_id or active_openvpn_node_id
+        for node in current:
+            node["active"] = bool(active_connection_running() and str(node.get("id")) == active_id)
+        history = pool_history()
+        for node in current:
+            history.update(node_pool.ip_keys(node))
+        write_json(DATA_DIR / "pool_history.json", sorted(history))
+        reserve_path = DATA_DIR / "pool_candidates.json"
+        reserve = read_json(reserve_path, [])
+        reserve = reserve if isinstance(reserve, list) else []
+        selected, counts = node_pool.select_pool(
+            current, reserve, history, protected, RESIDENTIAL_RETAIN_LIMIT,
+            HOSTING_RETAIN_LIMIT, POOL_PENDING_LIMIT, rotate,
+            AUTO_PRUNE_FAILURE_THRESHOLD)
+        shortage = counts["residential_missing"] or counts["hosting_missing"]
+        now = time.time()
+        state = get_state()
+        feed_due = now - float(state.get("pool_last_feed_at") or 0) >= POOL_REFILL_RETRY_SECONDS
+        errors = []
+        # A full, healthy pool is never refreshed merely because its cache is old.
+        if (shortage and feed_due) or refresh or (rotate and len(selected) <= len(protected)):
+            fresh = []
+            try:
+                fresh.extend(fetch_candidates())
+            except Exception as exc:
+                errors.append(f"OpenVPN: {exc}")
+            try:
+                proxies, _, _, proxy_errors = public_proxy_pool.fetch_all_sources()
+                countries = normalize_discovery_countries(load_ui_config().get("discovery_countries"))
+                fresh.extend(filter_candidates_by_discovery_countries(proxies, countries))
+                errors.extend(proxy_errors)
+            except Exception as exc:
+                errors.append(f"公共代理: {exc}")
+            blocked = load_blacklist()
+            seen_ids = {str(n.get("id")) for n in reserve}
+            for node in fresh:
+                if not node.get("id") or str(node["id"]) in blocked or str(node["id"]) in seen_ids:
+                    continue
+                if node_pool.ip_keys(node) & history:
+                    continue
+                reserve.append(node)
+                seen_ids.add(str(node["id"]))
+            set_state(pool_last_feed_at=time.time())
+            selected, counts = node_pool.select_pool(
+                current, reserve, history, protected, RESIDENTIAL_RETAIN_LIMIT,
+                HOSTING_RETAIN_LIMIT, POOL_PENDING_LIMIT, rotate,
+                AUTO_PRUNE_FAILURE_THRESHOLD)
+        new_nodes = [n for n in selected if str(n.get("id")) not in protected
+                     and not (node_pool.ip_keys(n) & history)]
+        if rotate and not new_nodes:
+            # Exhaustion or feed failure must not erase a usable current batch.
+            set_state(pool_message="没有未使用过的新 IP，保留当前批次；不会重复回收历史 IP",
+                      pool_last_error="；".join(map(str, errors)))
+            return
+        # Only unknown OpenVPN metadata is enriched, in bounded chunks.
+        attempted = set()
+        unknown = [n.copy() for n in selected if n.get("node_kind") != "public_proxy"
+                   and n.get("ip_type") not in {"residential", "hosting", "mobile", "proxy"}
+                   and time.time() - float(n.get("pool_classified_at") or 0) >= 900][:POOL_PROBE_BATCH]
+        if unknown:
+            vpn_utils.enrich_ip_info(unknown)
+            by_id = {str(n.get("id")): n for n in unknown}
+            for node in selected:
+                enriched = by_id.get(str(node.get("id")))
+                if enriched:
+                    node.update({f: enriched[f] for f in IP_ENRICHMENT_FIELDS if f in enriched})
+                    node["pool_classified_at"] = time.time()
+                    node["pool_classification_attempts"] = int(node.get("pool_classification_attempts") or 0) + 1
+                    attempted.update(node_pool.ip_keys(node))
+        selected, counts = node_pool.select_pool(
+            selected, [], history, protected, RESIDENTIAL_RETAIN_LIMIT,
+            HOSTING_RETAIN_LIMIT, POOL_PENDING_LIMIT,
+            failure_threshold=AUTO_PRUNE_FAILURE_THRESHOLD)
+        # Remember examined candidates too, including rejected mobile/unknown entries.
+        history.update(attempted)
+        write_json(DATA_DIR / "pool_history.json", sorted(history))
+        if rotate and not any(str(n.get("id")) not in protected for n in selected):
+            set_state(pool_message="新候选未能确认住宅/机房类型，保留当前批次；等待其他新 IP")
+            return
+        persist_pool(selected, counts)
+        selected_ids = {str(n.get("id")) for n in selected}
+        # Preserve only unseen reserve entries, not entire upstream feeds in the web list.
+        history = pool_history()
+        reserve = [n for n in reserve if str(n.get("id")) not in selected_ids
+                   and not (node_pool.ip_keys(n) & history)][:POOL_RESERVE_LIMIT]
+        write_json(reserve_path, reserve)
+        probe_nodes = sorted(
+            [n for n in selected if str(n.get("id")) not in protected and not n.get("active")
+             and now - float(n.get("probed_at") or 0) >= POOL_CHECK_SECONDS],
+            key=lambda n: float(n.get("probed_at") or 0),
+        )[:POOL_PROBE_BATCH]
+        if probe_nodes:
+            before_probe = {str(n.get("id")): node_pool.ip_keys(n) for n in selected}
+            test_combined_nodes([str(n["id"]) for n in probe_nodes])
+            # Exit IP classification may change after an actual proxy handshake.
+            latest = read_all_nodes()
+            # A newly discovered exit may belong to an older batch. Do not let
+            # the currently-retained exemption bypass historical exit-IP dedup.
+            latest = [n for n in latest if str(n.get("id")) in protected
+                      or not ((node_pool.ip_keys(n) - before_probe.get(str(n.get("id")), set())) & history)]
+            probed_ids = {str(n["id"]) for n in probe_nodes}
+            for node in latest:
+                if (str(node.get("id")) in probed_ids and node.get("node_kind") == "public_proxy"
+                        and node.get("ip_type") not in {"residential", "hosting", "mobile", "proxy"}):
+                    node["pool_classification_attempts"] = int(node.get("pool_classification_attempts") or 0) + 1
+            selected, counts = node_pool.select_pool(
+                latest, [], pool_history(), pool_protected_ids(), RESIDENTIAL_RETAIN_LIMIT,
+                HOSTING_RETAIN_LIMIT, POOL_PENDING_LIMIT,
+                failure_threshold=AUTO_PRUNE_FAILURE_THRESHOLD)
+            if rotate and not any(str(n.get("id")) not in protected for n in selected):
+                selected, counts = node_pool.select_pool(current, [], pool_history(), pool_protected_ids(),
+                    RESIDENTIAL_RETAIN_LIMIT, HOSTING_RETAIN_LIMIT, POOL_PENDING_LIMIT,
+                    failure_threshold=AUTO_PRUNE_FAILURE_THRESHOLD)
+                persist_pool(selected, counts)
+                set_state(pool_message="新候选失效或出口 IP 曾使用过，已保留原批次；没有重复回收 IP")
+                return
+            persist_pool(selected, counts)
+        message = (f"住宅 {counts['residential']}/{RESIDENTIAL_RETAIN_LIMIT}，"
+                   f"机房 {counts['hosting']}/{HOSTING_RETAIN_LIMIT}，待确认 {counts['pending']}；"
+                   f"已测可用：住宅 {counts['residential_available']}、机房 {counts['hosting_available']}；"
+                   f"缺额：住宅 {counts['residential_missing']}、机房 {counts['hosting_missing']}。"
+                   "上游不足或尚未验证时不会伪造数量；当前可用批次保持不变。")
+        set_state(pool_message=message, pool_last_error="；".join(map(str, errors)),
+                  pool_last_run_at=time.time(), last_check_message=message,
+                  last_check_at=time.time(), is_connecting=False)
+    except Exception as exc:
+        set_state(pool_message=f"后台补齐失败，保留已缓存节点: {exc}")
+        log_to_json("ERROR", "Pool", str(exc))
+    finally:
+        try:
+            if owns_busy:
+                with lock:
+                    is_connecting = False
+                set_state(is_connecting=False)
+        finally:
+            maintenance_lock.release()
+    # Restore the pre-existing initial/recovery connection behaviour without refetching.
+    cfg = load_ui_config()
+    if cfg.get("connection_enabled", True) and not active_connection_running():
+        try:
+            if cfg.get("routing_mode") == "fixed_ip":
+                reconnect_fixed_node_if_needed(cfg)
+            elif any(n.get("probe_status") == "available" for n in read_all_nodes()):
+                auto_switch_node()
+        except Exception as exc:
+            log_to_json("WARNING", "Pool", f"节点池连接恢复失败: {exc}")
+
+
+def start_pool_job(rotate: bool = False, refresh: bool = False) -> tuple[bool, str]:
+    global pool_job_thread
+    # Reserve the maintenance slot BEFORE acknowledging HTTP to avoid polling races.
+    if is_connecting or not maintenance_lock.acquire(blocking=False):
+        return False, "已有连接、检测或补齐任务，稍后再试"
+    pool_job_thread = threading.Thread(target=run_pool_maintenance,
+        kwargs={"rotate": rotate, "refresh": refresh, "lock_held": True}, daemon=True)
+    try:
+        pool_job_thread.start()
+    except Exception:
+        maintenance_lock.release()
+        raise
+    return True, "已启动后台换批（保护活动/收藏/固定节点）" if rotate else "已启动后台按缺额补齐"
+
+
 def collector_loop() -> None:
     global last_collector_heartbeat
     while True:
         last_collector_heartbeat = time.time()
-        success = False
-        try:
-            print("[守护线程] 开始执行节点拉取与可用性检测周期任务...", flush=True)
-            log_to_json("INFO", "Main", "开始执行节点拉取与可用性检测周期任务...")
-            res = maintain_valid_nodes(force=False)
-            if "没有拉取到新节点" not in res:
-                success = True
-            log_to_json("INFO", "Main", f"周期同步与检测任务完成，结果: {res}")
-        except Exception as exc:
-            err_msg = f"周期节点同步任务执行异常: {exc}"
-            print(f"[错误] {err_msg}", flush=True)
-            log_to_json("ERROR", "Main", err_msg)
-            set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
-            
-        if not active_connection_running() and not success:
-            sleep_time = 30
-        else:
-            sleep_time = CHECK_INTERVAL_SECONDS
-            
-        time.sleep(sleep_time)
+        start_pool_job()
+        time.sleep(POOL_CHECK_SECONDS)
 
 
 def public_proxy_collector_loop() -> None:
-    time.sleep(5)
-    while True:
-        try:
-            acquired = maintenance_lock.acquire(blocking=False)
-            if acquired:
-                try:
-                    refresh_public_proxy_pool()
-                finally:
-                    maintenance_lock.release()
-        except Exception as exc:
-            message = f"公共代理池自动更新失败: {exc}"
-            set_state(public_proxy_last_message=message)
-            log_to_json("ERROR", "Proxy", message)
-        time.sleep(PUBLIC_PROXY_REFRESH_SECONDS)
+    # Compatibility entry point: the unified pool collector now handles both transports.
+    collector_loop()
 
 
 def refresh_all_node_pools() -> None:
-    """Refresh OpenVPN candidates, then refresh and deduplicate public proxy feeds."""
-    try:
-        maintain_valid_nodes(False)
-    except Exception as exc:
-        log_to_json("ERROR", "VPN", f"手动更新 OpenVPN 节点失败: {exc}")
-    acquired = maintenance_lock.acquire(blocking=False)
-    if not acquired:
-        set_state(last_check_message="OpenVPN 节点已更新；公共代理池正由其他任务整理")
-        return
-    try:
-        result = refresh_public_proxy_pool()
-        set_state(last_check_message=result["message"])
-    except Exception as exc:
-        log_to_json("ERROR", "Proxy", f"手动更新公共代理池失败: {exc}")
-        set_state(last_check_message=f"OpenVPN 节点已更新；公共代理池更新失败: {exc}")
-    finally:
-        maintenance_lock.release()
+    run_pool_maintenance(refresh=True)
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -5550,6 +5752,10 @@ INDEX_HTML = r"""<!doctype html>
 
 
 
+  <div style="margin-bottom:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+    <button id="rotate_batch" class="btn" type="button">换下一批（IP 不重复）</button>
+    <span id="pool_summary" style="color:var(--text-secondary);font-size:13px;">正在读取缓存…</span>
+  </div>
   <section class="toolbar">
     <div class="toolbar-search">
       <svg class="search-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -6452,6 +6658,9 @@ function toggleFilteredNodeSelection(checked) {
 }
 
 function render(){
+  if ($("pool_summary")) $("pool_summary").textContent = state.pool_message || "缓存优先；后台按缺额补齐";
+  if ($("rotate_batch")) $("rotate_batch").disabled = Boolean(state.maintenance_running || state.is_connecting);
+
   const versionLabel = state.app_version_label || "V2.1.5 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
@@ -6889,14 +7098,10 @@ function updateAutoResidentialUI() {
   }
   const hostingStatus = $("hosting_rotation_status");
   if (hostingStatus) {
-    const hostingRunning = Boolean(state.hosting_maintenance_running);
     const poolCount = Number(state.hosting_pool_count) || 0;
-    const candidateLimit = Number(state.hosting_candidate_limit) || 200;
-    const retainLimit = Number(state.hosting_retain_limit) || 100;
-    hostingStatus.textContent = hostingRunning
-      ? (state.hosting_message || `正在从最多 ${candidateLimit} 个机房候选中筛选最快 ${retainLimit} 个…`)
-      : `机房池 ${poolCount}/${retainLimit}：最多抓取 ${candidateLimit} 个，按实测延迟、握手耗时和来源速度保留最快 ${retainLimit} 个；下次轮换：${formatScheduleTime(state.hosting_next_run_at)}`;
-    hostingStatus.style.color = hostingRunning ? "#34d399" : "#fbbf24";
+    const retainLimit = Number(state.hosting_retain_limit) || 50;
+    hostingStatus.textContent = `机房池 ${poolCount}/${retainLimit}：保持当前批次，连续失效后按缺额补齐；不再按天整池轮换。`;
+
   }
 }
 
@@ -7230,6 +7435,21 @@ $("sort_filter").onchange=()=>{ currentPage = 1; render(); };
 $("auto_residential_enabled").onchange=()=>{ autoResidentialDirty = true; updateAutoResidentialUI(); };
 $("auto_residential_interval").onchange=()=>{ autoResidentialDirty = true; updateAutoResidentialUI(); };
 
+$("rotate_batch").onclick = async () => {
+  if (!confirm("换成未使用过的新 IP？活动、收藏和固定节点会保留；没有新候选时保留当前批次。")) return;
+  $("rotate_batch").disabled = true;
+  try {
+    const response = await fetchWithTimeout("./api/rotate_nodes", {method:"POST"}, 20000);
+    const result = await readJsonResponse(response, "换批启动失败");
+    if (!response.ok || !result.ok) throw new Error(result.message || "换批失败");
+    await load();
+    startRefreshPolling();
+  } catch (e) {
+    alert(e.message || "换批失败");
+  } finally {
+    render();
+  }
+};
 $("refresh").onclick=async()=>{
   refreshButtonBusy("正在启动更新...");
   try{
@@ -8311,7 +8531,24 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
     def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        compressed = False
+        accepts_gzip = False
+        for part in self.headers.get("Accept-Encoding", "").split(","):
+            fields = [field.strip() for field in part.split(";")]
+            if fields[0].lower() != "gzip":
+                continue
+            try:
+                quality = next((float(field[2:]) for field in fields[1:] if field.startswith("q=")), 1.0)
+                accepts_gzip = quality > 0
+            except ValueError:
+                pass
+        if len(body) > 2048 and accepts_gzip:
+            body = gzip.compress(body, compresslevel=4)
+            compressed = True
         self.send_response(status)
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -8388,7 +8625,14 @@ class Handler(BaseHTTPRequestHandler):
                 if "config_text" in stripped:
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
-            self.send_json({"nodes": stripped_nodes, "state": get_state()})
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            page = max(1, parse_int(query.get("page", ["1"])[0]))
+            page_size = min(100, max(1, parse_int(query.get("page_size", ["50"])[0])))
+            total = len(stripped_nodes)
+            if "page" in query:
+                stripped_nodes = stripped_nodes[(page - 1) * page_size:page * page_size]
+            self.send_json({"nodes": stripped_nodes, "state": connection_state,
+                            "total": total, "page": page, "page_size": page_size})
         elif effective_path == "/api/check_update":
             try:
                 self.send_json(check_latest_release())
@@ -8808,6 +9052,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/rotate_nodes":
+            started, message = start_pool_job(rotate=True)
+            self.send_json({"ok": started, "message": message},
+                           HTTPStatus.OK if started else HTTPStatus.CONFLICT)
         elif effective_path == "/api/refresh_nodes":
             try:
                 payload = self.read_json_body()
@@ -8819,21 +9067,10 @@ class Handler(BaseHTTPRequestHandler):
                     discovery_countries = normalize_discovery_countries(
                         load_ui_config().get("discovery_countries")
                     )
-                if maintenance_lock.locked():
-                    self.send_json({
-                        "ok": True,
-                        "message": "节点维护任务正在运行，国家范围已保存并将在下一轮生效",
-                        "running": True,
-                        "discovery_countries": discovery_countries,
-                    })
-                else:
-                    threading.Thread(target=refresh_all_node_pools, daemon=True).start()
-                    self.send_json({
-                        "ok": True,
-                        "message": "已在后台启动 OpenVPN 与公共代理池更新、跨源去重流程",
-                        "running": True,
-                        "discovery_countries": discovery_countries,
-                    })
+                started, message = start_pool_job(refresh=True)
+                self.send_json({"ok": started, "message": message, "running": started,
+                                "discovery_countries": discovery_countries},
+                               HTTPStatus.OK if started else HTTPStatus.CONFLICT)
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
@@ -9101,7 +9338,7 @@ def main() -> None:
             "last_fetch_status": "starting",
             "last_fetch_source": "",
             "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
-            "is_connecting": True,
+            "is_connecting": False,
             "tunnel_ready": False,
             "proxy_ready": False,
             "proxy_ok": False,
@@ -9138,7 +9375,13 @@ def main() -> None:
     # Trim persisted data before the web service starts so the first dashboard
     # request does not have to serialize thousands of unwanted hosting rows.
     try:
-        enforce_global_hosting_limit(HOSTING_RETAIN_LIMIT)
+        cached = read_all_nodes()
+        for node in cached:
+            node["active"] = False  # No live tunnel survives a process restart.
+        cached, counts = node_pool.select_pool(cached, [], pool_history(), pool_protected_ids(),
+            RESIDENTIAL_RETAIN_LIMIT, HOSTING_RETAIN_LIMIT, POOL_PENDING_LIMIT,
+            failure_threshold=AUTO_PRUNE_FAILURE_THRESHOLD)
+        persist_pool(cached, counts)
     except Exception as exc:
         log_to_json("ERROR", "Hosting", f"启动时修剪机房节点失败: {exc}")
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
@@ -9187,12 +9430,9 @@ def main() -> None:
         print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
     threading.Thread(target=collector_loop, daemon=True).start()
-    threading.Thread(target=ip_enrichment_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     threading.Thread(target=auto_residential_scheduler_loop, daemon=True).start()
-    threading.Thread(target=hosting_scheduler_loop, daemon=True).start()
-    threading.Thread(target=public_proxy_collector_loop, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)

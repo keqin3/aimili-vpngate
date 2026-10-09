@@ -67,6 +67,33 @@ path.write_text("\n".join(updated) + "\n", encoding="utf-8")
 PY
 fi
 
+# Migrate earlier unbounded/100-hosting defaults once; keep all unrelated settings.
+env_file="/etc/default/aimilivpn"
+if [ -f "${env_file}" ]; then
+    cp -p "${env_file}" "${env_file}.before-pool-${timestamp}"
+    chmod 600 "${env_file}.before-pool-${timestamp}"
+fi
+python3 - "${env_file}" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+if not any(line.startswith("POOL_POLICY_VERSION=") for line in lines):
+    values = {"RESIDENTIAL_RETAIN_LIMIT": "200", "HOSTING_RETAIN_LIMIT": "50",
+              "EXTERNAL_SOURCE_MAX_PROFILES": "40", "POOL_PENDING_LIMIT": "60",
+              "POOL_PROBE_BATCH": "20", "POOL_CHECK_SECONDS": "300",
+              "POOL_REFILL_RETRY_SECONDS": "900", "POOL_POLICY_VERSION": "1"}
+    output = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip()
+        if key in values:
+            continue
+        output.append(line)
+    output.extend(f"{key}={value}" for key, value in values.items())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+PY
+
 echo "[5/5] 验证服务"
 if command -v systemctl >/dev/null 2>&1; then
     systemctl restart aimilivpn.service
@@ -78,4 +105,4 @@ else
     echo "警告: 未检测到 systemd/OpenRC，请手动启动 ${INSTALL_DIR}/vpngate_manager.py" >&2
 fi
 
-echo "升级完成。默认聚合 vpngate、ipspeed、vpngate_scraper、auto_ovpn；测速后低延迟优先，连续两轮失效节点自动清理。"
+echo "升级完成。缓存优先加载；住宅目标 200、机房目标 50；失效按缺额补齐，网页支持换下一批且 IP 历史去重。"
